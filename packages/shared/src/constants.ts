@@ -12,20 +12,21 @@ export const JOB_EXPIRATION_HOURS = 24;
  * - Supported paper: A4, Letter, Legal
  * - Max copies: 99
  * - Manual duplex requires physical human paper re-insertion and is NOT unattended.
+ * Note: Configurable UNC share path, defaulting to standard shared office printer name.
  */
 export const HP_LASERJET_M1136_CAPABILITY: PrinterCapability = {
   id: 'hp-laserjet-m1136',
   name: 'HP LaserJet Professional M1136 MFP',
-  host: 'SILVERTOUCH-PC',
+  host: 'OFFICE-HOST',
   shareName: 'HP LaserJet Professional M1136 MFP',
-  fullUncPath: '\\\\SILVERTOUCH-PC\\HP LaserJet Professional M1136 MFP',
+  fullUncPath: '\\\\OFFICE-HOST\\HP LaserJet Professional M1136 MFP',
   isOnline: true,
   supportsColor: false,
   supportsAutoDuplex: false,
   supportsManualDuplex: true,
   supportedPaperSizes: ['a4', 'letter', 'legal'],
   maxCopies: 99,
-  description: 'Shared monochrome office laser printer on SILVERTOUCH-PC'
+  description: 'Shared monochrome office laser printer on office host'
 };
 
 export const MOCK_PRINTER_CAPABILITY: PrinterCapability = {

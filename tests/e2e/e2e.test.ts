@@ -8,13 +8,14 @@ import { RendererRegistry } from '../../packages/renderers/dist/index.js';
 import { PrintSettings } from '../../packages/shared/dist/index.js';
 
 test('End-to-End Workflow: Upload -> API Queue -> Lease Claim -> Render -> Spool Handoff -> Cleanup', async () => {
-  const apiKey = 'dtc-secure-gateway-token-2025';
-  const api = new PrintBridgeApi(apiKey);
+  const apiKey = 'dtc-secure-gateway-token-e2e';
+  const employeeSecret = 'dtc-employee-secret-e2e';
+  const api = new PrintBridgeApi({ apiKey, employeeSecret });
   const registry = new RendererRegistry();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pb-e2e-'));
 
   try {
-    // 1. User submits a print job with 3-page text document
+    // 1. Authenticated user submits a print job with 3-page text document
     const textContent = Array.from({ length: 150 }, (_, i) => `E2E Test Invoice Line ${i + 1}`).join('\n');
     const textBytes = new TextEncoder().encode(textContent);
 
@@ -29,10 +30,13 @@ test('End-to-End Workflow: Upload -> API Queue -> Lease Claim -> Render -> Spool
       collate: true
     };
 
+    const auth = api.authenticateEmployee(`Bearer ${employeeSecret}`);
+    assert.equal(auth.tenantId, 'dtc-office');
+
     const createRes = await api.createJob({
-      tenantId: 'dtc-office',
-      userId: 'usr_sarah',
-      userEmail: 'sarah@dtc.local',
+      tenantId: auth.tenantId,
+      userId: auth.userId,
+      userEmail: auth.userEmail,
       printerId: 'hp-laserjet-m1136',
       filename: 'invoice.txt',
       fileBytes: textBytes,
@@ -53,6 +57,7 @@ test('End-to-End Workflow: Upload -> API Queue -> Lease Claim -> Render -> Spool
     assert.ok(claimRes.job);
     assert.equal(claimRes.job?.id, jobId);
     assert.equal(claimRes.job?.status, 'claimed');
+    assert.ok(claimRes.leaseToken);
 
     // 3. Agent writes file to isolated sandbox
     const jobDir = path.join(tempDir, jobId);
@@ -82,7 +87,7 @@ test('End-to-End Workflow: Upload -> API Queue -> Lease Claim -> Render -> Spool
       agentId: 'win10-gateway-office',
       leaseToken: claimRes.leaseToken!,
       status: 'completed',
-      statusMessage: 'Spooler confirmed output of 2 pages on HP LaserJet M1136'
+      statusMessage: 'Spooler confirmed output of 2 pages on office printer'
     }, apiKey);
 
     assert.equal(updateRes.success, true);
@@ -94,7 +99,7 @@ test('End-to-End Workflow: Upload -> API Queue -> Lease Claim -> Render -> Spool
     fs.rmSync(jobDir, { recursive: true, force: true });
     assert.equal(fs.existsSync(jobDir), false);
 
-    const finalJob = api.getJob(jobId);
+    const finalJob = await api.getJob(jobId);
     assert.equal(finalJob?.status, 'completed');
     assert.ok(finalJob?.completedAt);
   } finally {

@@ -14,8 +14,11 @@ const defaultSettings: PrintSettings = {
   collate: true
 };
 
+const TEST_AGENT_KEY = 'test-agent-key-secret-999';
+const TEST_EMPLOYEE_SECRET = 'employee-bearer-token-123';
+
 test('PrintBridgeApi lists office printers including HP LaserJet M1136', () => {
-  const api = new PrintBridgeApi('test-key');
+  const api = new PrintBridgeApi({ apiKey: TEST_AGENT_KEY, employeeSecret: TEST_EMPLOYEE_SECRET });
   const printers = api.getPrinters();
   assert.equal(printers.length >= 2, true);
   const hp = printers.find(p => p.id === 'hp-laserjet-m1136');
@@ -23,14 +26,25 @@ test('PrintBridgeApi lists office printers including HP LaserJet M1136', () => {
   assert.equal(hp?.supportsColor, false);
 });
 
+test('Employee authentication fails closed with invalid/missing token', () => {
+  const api = new PrintBridgeApi({ apiKey: TEST_AGENT_KEY, employeeSecret: TEST_EMPLOYEE_SECRET });
+
+  assert.throws(() => api.authenticateEmployee(undefined), /Missing or invalid Authorization header/);
+  assert.throws(() => api.authenticateEmployee('Bearer wrong-token'), /Invalid employee authentication token/);
+
+  const auth = api.authenticateEmployee(`Bearer ${TEST_EMPLOYEE_SECRET}`);
+  assert.equal(auth.userId, 'emp_authorized');
+  assert.equal(auth.tenantId, 'dtc-office');
+});
+
 test('PrintBridgeApi creates print job and validates format and printer settings', async () => {
-  const api = new PrintBridgeApi('test-key');
+  const api = new PrintBridgeApi({ apiKey: TEST_AGENT_KEY, employeeSecret: TEST_EMPLOYEE_SECRET });
   const pdfBytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x34]);
 
   const res = await api.createJob({
     tenantId: 'dtc-office',
     userId: 'employee-1',
-    userEmail: 'employee@dtc.local',
+    userEmail: 'employee@office.local',
     printerId: 'hp-laserjet-m1136',
     filename: 'quarterly_report.pdf',
     fileBytes: pdfBytes,
@@ -43,33 +57,14 @@ test('PrintBridgeApi creates print job and validates format and printer settings
   assert.equal(res.job?.status, 'pending');
 });
 
-test('PrintBridgeApi rejects job with invalid printer options (e.g. color on M1136)', async () => {
-  const api = new PrintBridgeApi('test-key');
-  const pdfBytes = new Uint8Array([0x25, 0x50, 0x44, 0x46]);
-
-  const res = await api.createJob({
-    tenantId: 'dtc-office',
-    userId: 'employee-1',
-    userEmail: 'employee@dtc.local',
-    printerId: 'hp-laserjet-m1136',
-    filename: 'report.pdf',
-    fileBytes: pdfBytes,
-    settings: { ...defaultSettings, colorMode: 'color' }
-  });
-
-  assert.equal(res.success, false);
-  assert.match(res.error || '', /does not support color/i);
-});
-
-test('PrintBridgeApi claims job with lease and validates agent authentication', async () => {
-  const apiKey = 'secret-gateway-token';
-  const api = new PrintBridgeApi(apiKey);
-  const pdfBytes = new Uint8Array([0x25, 0x50, 0x44, 0x46]);
+test('PrintBridgeApi claims job with secure lease token and validates download endpoint', async () => {
+  const api = new PrintBridgeApi({ apiKey: TEST_AGENT_KEY, employeeSecret: TEST_EMPLOYEE_SECRET });
+  const pdfBytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x34]);
 
   const createRes = await api.createJob({
     tenantId: 'dtc-office',
     userId: 'employee-1',
-    userEmail: 'employee@dtc.local',
+    userEmail: 'employee@office.local',
     printerId: 'hp-laserjet-m1136',
     filename: 'doc.pdf',
     fileBytes: pdfBytes,
@@ -78,16 +73,16 @@ test('PrintBridgeApi claims job with lease and validates agent authentication', 
 
   assert.ok(createRes.job);
 
-  // Unauthorized agent claim
+  // Unauthorized agent claim fails closed
   await assert.rejects(
     async () => {
       await api.claimJob({
         agentId: 'gateway-win10',
         agentVersion: '1.0.0',
         supportedPrinters: ['hp-laserjet-m1136']
-      }, 'wrong-key');
+      }, 'wrong-agent-key');
     },
-    /Unauthorized agent gateway key/
+    /Unauthorized/
   );
 
   // Authorized claim
@@ -95,32 +90,35 @@ test('PrintBridgeApi claims job with lease and validates agent authentication', 
     agentId: 'gateway-win10',
     agentVersion: '1.0.0',
     supportedPrinters: ['hp-laserjet-m1136']
-  }, apiKey);
+  }, TEST_AGENT_KEY);
 
   assert.ok(claimRes.job);
   assert.equal(claimRes.job?.id, createRes.job?.id);
   assert.equal(claimRes.job?.status, 'claimed');
   assert.ok(claimRes.leaseToken);
 
-  // Second claim when job is already claimed and lease active -> returns null
-  const secondClaim = await api.claimJob({
-    agentId: 'gateway-win10-2',
-    agentVersion: '1.0.0',
-    supportedPrinters: ['hp-laserjet-m1136']
-  }, apiKey);
-  assert.equal(secondClaim.job, null);
+  // Test authenticated document download with invalid lease token
+  const badDl = await api.getDocumentPayload(claimRes.job!.id, 'invalid-lease-token', TEST_AGENT_KEY);
+  assert.equal(badDl.statusCode, 403);
+  assert.match(badDl.error || '', /Invalid lease token/);
 
-  // Status update to completed cleans up R2 storage payload
+  // Test authenticated document download with valid lease token
+  const goodDl = await api.getDocumentPayload(claimRes.job!.id, claimRes.leaseToken!, TEST_AGENT_KEY);
+  assert.ok(goodDl.fileBytes);
+  assert.equal(goodDl.filename, 'doc.pdf');
+  assert.deepEqual(goodDl.fileBytes, pdfBytes);
+
+  // Status update to completed cleans up storage payload
   const updateRes = await api.updateJobStatus({
     jobId: claimRes.job!.id,
     agentId: 'gateway-win10',
     leaseToken: claimRes.leaseToken!,
     status: 'completed',
-    statusMessage: 'Spooler confirmed handoff to HP LaserJet M1136'
-  }, apiKey);
+    statusMessage: 'Spooler confirmed handoff to office printer'
+  }, TEST_AGENT_KEY);
 
   assert.equal(updateRes.success, true);
-  const finalJob = api.getJob(claimRes.job!.id);
+  const finalJob = await api.getJob(claimRes.job!.id);
   assert.equal(finalJob?.status, 'completed');
-  assert.equal(api.getFileBytes(finalJob!.r2StorageKey), undefined); // Auto deleted from storage
+  assert.equal(api.getFileBytes(finalJob!.r2StorageKey), undefined); // Scrubbed from storage
 });

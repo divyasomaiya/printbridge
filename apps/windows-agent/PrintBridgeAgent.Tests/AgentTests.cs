@@ -23,12 +23,96 @@ public class AgentTests
             var safeFile = sandbox.ResolveSafeFilePath(jobDir, "document.pdf");
             Assert.StartsWith(jobDir, safeFile);
 
-            // Directory traversal attempt: ../../etc/passwd or C:\Windows
+            // Directory traversal attempt: ../../etc/passwd
             var maliciousPath = Path.Combine(jobDir, "../../etc/passwd");
             Assert.Throws<UnauthorizedAccessException>(() =>
             {
                 sandbox.AssertPathSafe(maliciousPath);
             });
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot))
+            {
+                Directory.Delete(tempRoot, true);
+            }
+        }
+    }
+
+    [Fact]
+    public void FileSandbox_Adversarial_PreventsSiblingPrefixBypass()
+    {
+        var baseDir = Path.Combine(Path.GetTempPath(), "pb_sb_base_" + Guid.NewGuid());
+        var allowedRoot = Path.Combine(baseDir, "PrintBridgeTemp");
+        var siblingBypassPath = Path.Combine(baseDir, "PrintBridgeTemp2"); // Sibling prefix match
+
+        Directory.CreateDirectory(allowedRoot);
+        Directory.CreateDirectory(siblingBypassPath);
+
+        try
+        {
+            var sandbox = new FileSandbox(allowedRoot);
+
+            // Trying to assert or access the sibling directory must fail closed
+            Assert.Throws<UnauthorizedAccessException>(() =>
+            {
+                sandbox.AssertPathSafe(siblingBypassPath);
+            });
+
+            Assert.Throws<UnauthorizedAccessException>(() =>
+            {
+                sandbox.AssertPathSafe(Path.Combine(siblingBypassPath, "secret.txt"));
+            });
+        }
+        finally
+        {
+            if (Directory.Exists(baseDir))
+            {
+                Directory.Delete(baseDir, true);
+            }
+        }
+    }
+
+    [Fact]
+    public void FileSandbox_Adversarial_RejectsEmptyAndMalformedJobIds()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "pb_jobid_test_" + Guid.NewGuid());
+        var sandbox = new FileSandbox(tempRoot);
+
+        try
+        {
+            Assert.Throws<ArgumentException>(() => sandbox.CreateJobWorkingDir(""));
+            Assert.Throws<ArgumentException>(() => sandbox.CreateJobWorkingDir("   "));
+            Assert.Throws<ArgumentException>(() => sandbox.CreateJobWorkingDir("."));
+            Assert.Throws<ArgumentException>(() => sandbox.CreateJobWorkingDir(".."));
+            Assert.Throws<ArgumentException>(() => sandbox.CreateJobWorkingDir("../../root"));
+            Assert.Throws<ArgumentException>(() => sandbox.CreateJobWorkingDir("job/123"));
+            Assert.Throws<ArgumentException>(() => sandbox.CreateJobWorkingDir("job\\123"));
+            Assert.Throws<ArgumentException>(() => sandbox.CreateJobWorkingDir("job:123"));
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot))
+            {
+                Directory.Delete(tempRoot, true);
+            }
+        }
+    }
+
+    [Fact]
+    public void FileSandbox_Adversarial_PreventsSandboxRootDeletion()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "pb_rootdel_test_" + Guid.NewGuid());
+        var sandbox = new FileSandbox(tempRoot);
+
+        try
+        {
+            // Direct attempt to cleanup the sandbox root itself
+            Assert.Throws<UnauthorizedAccessException>(() => sandbox.SecureCleanup(tempRoot));
+            Assert.Throws<UnauthorizedAccessException>(() => sandbox.SecureCleanup(tempRoot + Path.DirectorySeparatorChar));
+
+            // Attempt to clean up parent or sibling
+            Assert.Throws<UnauthorizedAccessException>(() => sandbox.SecureCleanup(Path.GetDirectoryName(tempRoot)!));
         }
         finally
         {
@@ -71,11 +155,11 @@ public class AgentTests
         var settings = new PrintSettings(1, "portrait", "a4", "all", null, "simplex", "grayscale", "fit", true, null, null);
         var payload = Encoding.UTF8.GetBytes("Test RAW print payload");
 
-        var result = mockSpooler.SubmitSpoolJob(@"\\SILVERTOUCH-PC\HP LaserJet Professional M1136 MFP", "test_job_1", payload, settings);
+        var result = mockSpooler.SubmitSpoolJob(@"\\OFFICE-HOST\HP_LaserJet_M1136", "test_job_1", payload, settings);
 
         Assert.True(result.Success);
         Assert.Single(mockSpooler.SpooledJobs);
-        Assert.Equal(@"\\SILVERTOUCH-PC\HP LaserJet Professional M1136 MFP", mockSpooler.SpooledJobs[0].Printer);
+        Assert.Equal(@"\\OFFICE-HOST\HP_LaserJet_M1136", mockSpooler.SpooledJobs[0].Printer);
         Assert.Equal(payload.Length, mockSpooler.SpooledJobs[0].BytesLength);
     }
 
@@ -85,15 +169,14 @@ public class AgentTests
         var tempRoot = Path.Combine(Path.GetTempPath(), "pb_worker_test_" + Guid.NewGuid());
         var mockSpooler = new MockSpooler();
 
-        // Custom HttpMessageHandler to simulate API responses
         var mockHandler = new MockHttpMessageHandler();
         var httpClient = new HttpClient(mockHandler) { BaseAddress = new Uri("http://mock-api.local") };
 
         var config = new AgentConfig(
             ApiBaseUrl: "http://mock-api.local",
-            AgentKey: "test-key",
+            AgentKey: "test-key-configured",
             AgentId: "test-agent",
-            TargetPrinterUncPath: @"\\SILVERTOUCH-PC\HP LaserJet Professional M1136 MFP",
+            TargetPrinterUncPath: @"\\OFFICE-HOST\HP_LaserJet_M1136",
             TempDirectory: tempRoot,
             PollIntervalSeconds: 1,
             DryRun: true,

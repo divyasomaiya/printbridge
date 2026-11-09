@@ -10,7 +10,7 @@ const index_js_1 = require("../../packages/shared/dist/index.js");
     strict_1.default.equal(index_js_1.HP_LASERJET_M1136_CAPABILITY.supportsColor, false);
     strict_1.default.equal(index_js_1.HP_LASERJET_M1136_CAPABILITY.supportsAutoDuplex, false);
     strict_1.default.equal(index_js_1.HP_LASERJET_M1136_CAPABILITY.supportsManualDuplex, true);
-    strict_1.default.equal(index_js_1.HP_LASERJET_M1136_CAPABILITY.host, 'SILVERTOUCH-PC');
+    strict_1.default.equal(index_js_1.HP_LASERJET_M1136_CAPABILITY.host, 'OFFICE-HOST');
 });
 (0, node_test_1.default)('validatePrintSettings rejects color on monochrome printer', () => {
     const settings = {

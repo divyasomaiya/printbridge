@@ -16,10 +16,10 @@ public static class Program
         bool diagnose = args.Contains("--diagnose");
         bool listPrinters = args.Contains("--list-printers");
 
-        string apiBaseUrl = Environment.GetEnvironmentVariable("PB_API_URL") ?? "https://print-bridge.dtc.local";
-        string agentKey = Environment.GetEnvironmentVariable("PB_AGENT_KEY") ?? "dtc-secure-gateway-token-2025";
+        string? apiBaseUrl = Environment.GetEnvironmentVariable("PB_API_URL");
+        string? agentKey = Environment.GetEnvironmentVariable("PB_AGENT_KEY");
         string agentId = Environment.GetEnvironmentVariable("PB_AGENT_ID") ?? $"gw-{Environment.MachineName}";
-        string printerUnc = Environment.GetEnvironmentVariable("PB_PRINTER_UNC") ?? @"\\SILVERTOUCH-PC\HP LaserJet Professional M1136 MFP";
+        string printerUnc = Environment.GetEnvironmentVariable("PB_PRINTER_UNC") ?? @"\\OFFICE-HOST\HP_LaserJet_M1136";
         string tempDir = Environment.GetEnvironmentVariable("PB_TEMP_DIR") ?? Path.Combine(Path.GetTempPath(), "PrintBridgeTemp");
 
         if (listPrinters)
@@ -36,7 +36,8 @@ public static class Program
             Console.WriteLine($"  Machine Name:     {Environment.MachineName}");
             Console.WriteLine($"  OS Version:       {Environment.OSVersion}");
             Console.WriteLine($"  64-bit Process:   {Environment.Is64BitProcess}");
-            Console.WriteLine($"  API Endpoint:     {apiBaseUrl}");
+            Console.WriteLine($"  API Endpoint:     {apiBaseUrl ?? "(NOT CONFIGURED)"}");
+            Console.WriteLine($"  Agent Key Set:    {!string.IsNullOrEmpty(agentKey)}");
             Console.WriteLine($"  Sandbox Path:     {tempDir}");
             Console.WriteLine($"  Target Printer:   {printerUnc}");
             Console.WriteLine($"  Dry Run Mode:     {dryRun}");
@@ -46,6 +47,19 @@ public static class Program
             bool printerOk = spooler.IsPrinterAvailable(printerUnc);
             Console.WriteLine($"  Printer Reachable: {(printerOk || mockPrinter ? "YES" : "NO (Check network/sharing)")}");
             return 0;
+        }
+
+        // P0 Security requirement: Fail closed if credentials or API URL are not configured
+        if (string.IsNullOrWhiteSpace(apiBaseUrl) || string.IsNullOrWhiteSpace(agentKey))
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine("FATAL ERROR: Missing required configuration.");
+            Console.WriteLine("PB_API_URL and PB_AGENT_KEY must be provided via environment variables.");
+            Console.WriteLine("Example:");
+            Console.WriteLine("  set PB_API_URL=https://print.dtc.local");
+            Console.WriteLine("  set PB_AGENT_KEY=your_secure_agent_key");
+            Console.ResetColor();
+            return 1;
         }
 
         var config = new AgentConfig(
