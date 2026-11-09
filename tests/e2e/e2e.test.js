@@ -30,7 +30,9 @@ const index_js_2 = require("../../packages/renderers/dist/index.js");
             scaling: 'fit',
             collate: true
         };
-        const auth = api.authenticateEmployee(`Bearer ${employeeSecret}`);
+        const headers = new Headers();
+        headers.set('Authorization', `Bearer ${employeeSecret}`);
+        const auth = api.authenticateEmployee(headers);
         strict_1.default.equal(auth.tenantId, 'dtc-office');
         const createRes = await api.createJob({
             tenantId: auth.tenantId,

@@ -21,7 +21,72 @@ document.addEventListener('DOMContentLoaded', () => {
   const statusText = document.getElementById('statusText') as HTMLSpanElement;
   const statusDetails = document.getElementById('statusDetails') as HTMLParagraphElement;
 
+  const authStatusText = document.getElementById('authStatusText') as HTMLSpanElement;
+  const authBtn = document.getElementById('authBtn') as HTMLButtonElement;
+  const authDialog = document.getElementById('authDialog') as HTMLDivElement;
+  const employeePasskeyInput = document.getElementById('employeePasskeyInput') as HTMLInputElement;
+  const saveAuthBtn = document.getElementById('saveAuthBtn') as HTMLButtonElement;
+  const cancelAuthBtn = document.getElementById('cancelAuthBtn') as HTMLButtonElement;
+
   let selectedFile: File | null = null;
+
+  // Manage employee passkey/token in localStorage (never hardcoded in source)
+  function getStoredToken(): string | null {
+    return localStorage.getItem('pb_employee_token');
+  }
+
+  function updateAuthUI() {
+    const token = getStoredToken();
+    if (token) {
+      authStatusText.textContent = 'Device Authorized (Office Access)';
+      authStatusText.style.color = '#15803d';
+      authBtn.textContent = 'Change PIN';
+    } else {
+      authStatusText.textContent = 'Authorization required before printing';
+      authStatusText.style.color = '#b45309';
+      authBtn.textContent = 'Enter Office PIN';
+    }
+  }
+
+  authBtn.addEventListener('click', () => {
+    authDialog.style.display = 'block';
+    employeePasskeyInput.focus();
+  });
+
+  cancelAuthBtn.addEventListener('click', () => {
+    authDialog.style.display = 'none';
+  });
+
+  saveAuthBtn.addEventListener('click', async () => {
+    const val = employeePasskeyInput.value.trim();
+    if (!val) return;
+
+    try {
+      // Exchange PIN/passkey with backend to obtain a verified session token
+      const res = await fetch('/api/auth/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ passkey: val })
+      });
+      const data = await res.json();
+      if (res.ok && data.token) {
+        localStorage.setItem('pb_employee_token', data.token);
+        authDialog.style.display = 'none';
+        employeePasskeyInput.value = '';
+        updateAuthUI();
+      } else {
+        alert(data.error || 'Authorization failed: Invalid office PIN');
+      }
+    } catch {
+      // Offline / fallback direct token assignment for local testing
+      localStorage.setItem('pb_employee_token', val);
+      authDialog.style.display = 'none';
+      employeePasskeyInput.value = '';
+      updateAuthUI();
+    }
+  });
+
+  updateAuthUI();
 
   // Dropzone drag-and-drop
   dropzone.addEventListener('click', () => fileInput.click());
@@ -92,6 +157,13 @@ document.addEventListener('DOMContentLoaded', () => {
   submitJobBtn.addEventListener('click', async () => {
     if (!selectedFile) return;
 
+    const token = getStoredToken();
+    if (!token) {
+      authDialog.style.display = 'block';
+      employeePasskeyInput.focus();
+      return;
+    }
+
     submitJobBtn.disabled = true;
     statusSection.style.display = 'block';
     statusText.textContent = 'Uploading document...';
@@ -120,14 +192,36 @@ document.addEventListener('DOMContentLoaded', () => {
       try {
         const response = await fetch('/api/jobs', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
           body: JSON.stringify(payload)
         });
 
         const resData = await response.json();
         if (response.ok && resData.success) {
           statusText.textContent = 'Print Job Enqueued';
-          statusDetails.textContent = `Job ID: ${resData.job.id} — Waiting for Windows gateway on SILVERTOUCH-PC...`;
+          statusDetails.textContent = `Job ID: ${resData.job.id} — Waiting for Windows gateway...`;
+
+          // Track job status periodically
+          const pollInterval = setInterval(async () => {
+            try {
+              const stRes = await fetch(`/api/jobs/${resData.job.id}`, {
+                headers: { 'Authorization': `Bearer ${token}` }
+              });
+              if (stRes.ok) {
+                const jobStatus = await stRes.json();
+                statusText.textContent = `Status: ${jobStatus.status.toUpperCase()}`;
+                statusDetails.textContent = jobStatus.statusMessage || `Job is ${jobStatus.status}`;
+                if (['completed', 'failed', 'cancelled'].includes(jobStatus.status)) {
+                  clearInterval(pollInterval);
+                }
+              }
+            } catch {
+              // ignore transient poll failure
+            }
+          }, 3000);
         } else {
           statusText.textContent = 'Submission Rejected';
           statusDetails.textContent = resData.error || 'Unknown error occurred.';

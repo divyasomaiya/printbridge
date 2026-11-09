@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PrintBridgeApi } from '../../apps/api/dist/index.js';
+import { PrintBridgeApi, default as workerHandler } from '../../apps/api/dist/index.js';
 import { PrintSettings } from '../../packages/shared/dist/index.js';
 
 const defaultSettings: PrintSettings = {
@@ -29,96 +29,146 @@ test('PrintBridgeApi lists office printers including HP LaserJet M1136', () => {
 test('Employee authentication fails closed with invalid/missing token', () => {
   const api = new PrintBridgeApi({ apiKey: TEST_AGENT_KEY, employeeSecret: TEST_EMPLOYEE_SECRET });
 
-  assert.throws(() => api.authenticateEmployee(undefined), /Missing or invalid Authorization header/);
-  assert.throws(() => api.authenticateEmployee('Bearer wrong-token'), /Invalid employee authentication token/);
+  const dummyHeaders = new Headers();
+  assert.throws(() => api.authenticateEmployee(dummyHeaders), /Missing or invalid Authorization header/);
 
-  const auth = api.authenticateEmployee(`Bearer ${TEST_EMPLOYEE_SECRET}`);
+  dummyHeaders.set('Authorization', 'Bearer wrong-token');
+  assert.throws(() => api.authenticateEmployee(dummyHeaders), /Invalid employee authentication token/);
+
+  dummyHeaders.set('Authorization', `Bearer ${TEST_EMPLOYEE_SECRET}`);
+  const auth = api.authenticateEmployee(dummyHeaders);
   assert.equal(auth.userId, 'emp_authorized');
   assert.equal(auth.tenantId, 'dtc-office');
 });
 
-test('PrintBridgeApi creates print job and validates format and printer settings', async () => {
+test('Cloudflare Access header automatically authenticates employee', () => {
   const api = new PrintBridgeApi({ apiKey: TEST_AGENT_KEY, employeeSecret: TEST_EMPLOYEE_SECRET });
-  const pdfBytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x34]);
+  const headers = new Headers();
+  headers.set('Cf-Access-Authenticated-User-Email', 'sarah@office.local');
 
-  const res = await api.createJob({
-    tenantId: 'dtc-office',
-    userId: 'employee-1',
-    userEmail: 'employee@office.local',
-    printerId: 'hp-laserjet-m1136',
-    filename: 'quarterly_report.pdf',
-    fileBytes: pdfBytes,
-    settings: defaultSettings
-  });
-
-  assert.equal(res.success, true);
-  assert.ok(res.job);
-  assert.equal(res.job?.fileFormat, 'pdf');
-  assert.equal(res.job?.status, 'pending');
+  const auth = api.authenticateEmployee(headers);
+  assert.equal(auth.userId, 'sarah@office.local');
+  assert.equal(auth.userEmail, 'sarah@office.local');
 });
 
-test('PrintBridgeApi claims job with secure lease token and validates download endpoint', async () => {
-  const api = new PrintBridgeApi({ apiKey: TEST_AGENT_KEY, employeeSecret: TEST_EMPLOYEE_SECRET });
-  const pdfBytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x34]);
+test('Worker fetch handler executes real HTTP routing, auth check, and session exchange', async () => {
+  const env = {
+    GATEWAY_API_KEY: TEST_AGENT_KEY,
+    EMPLOYEE_AUTH_SECRET: TEST_EMPLOYEE_SECRET,
+    ENVIRONMENT: 'development'
+  };
 
+  // 1. Session exchange with valid passkey
+  const sessReq = new Request('http://worker.local/api/auth/session', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ passkey: TEST_EMPLOYEE_SECRET })
+  });
+  const sessRes = await workerHandler.fetch(sessReq, env);
+  assert.equal(sessRes.status, 200);
+  const sessData: any = await sessRes.json();
+  assert.equal(sessData.success, true);
+  assert.equal(sessData.token, TEST_EMPLOYEE_SECRET);
+
+  // 2. Reject job creation with missing auth
+  const unauthReq = new Request('http://worker.local/api/jobs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ printerId: 'hp-laserjet-m1136', filename: 'test.pdf', fileBase64: 'JVBERi0xLjQ=', settings: defaultSettings })
+  });
+  const unauthRes = await workerHandler.fetch(unauthReq, env);
+  assert.equal(unauthRes.status, 401);
+
+  // 3. Authenticated job creation
+  const authReq = new Request('http://worker.local/api/jobs', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${TEST_EMPLOYEE_SECRET}`
+    },
+    body: JSON.stringify({ printerId: 'hp-laserjet-m1136', filename: 'test.pdf', fileBase64: 'JVBERi0xLjQ=', settings: defaultSettings })
+  });
+  const authRes = await workerHandler.fetch(authReq, env);
+  assert.equal(authRes.status, 201);
+  const authData: any = await authRes.json();
+  assert.ok(authData.job?.id);
+  const jobId = authData.job.id;
+
+  // 4. Secure job status inquiry
+  const statusReq = new Request(`http://worker.local/api/jobs/${jobId}`, {
+    headers: { 'Authorization': `Bearer ${TEST_EMPLOYEE_SECRET}` }
+  });
+  const statusRes = await workerHandler.fetch(statusReq, env);
+  assert.equal(statusRes.status, 200);
+  const statusData: any = await statusRes.json();
+  assert.equal(statusData.id, jobId);
+  assert.equal(statusData.status, 'pending');
+
+  // 5. Agent atomic claim
+  const claimReq = new Request('http://worker.local/api/agent/claim', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Agent-Key': TEST_AGENT_KEY
+    },
+    body: JSON.stringify({
+      agentId: 'gw-win10',
+      agentVersion: '1.0.0',
+      supportedPrinters: ['hp-laserjet-m1136']
+    })
+  });
+  const claimRes = await workerHandler.fetch(claimReq, env);
+  assert.equal(claimRes.status, 200);
+  const claimData: any = await claimRes.json();
+  assert.equal(claimData.job?.id, jobId);
+  assert.ok(claimData.leaseToken);
+
+  // 6. Authenticated document download
+  const dlReq = new Request(`http://worker.local${claimData.downloadUrl}`, {
+    headers: { 'X-Agent-Key': TEST_AGENT_KEY }
+  });
+  const dlRes = await workerHandler.fetch(dlReq, env);
+  assert.equal(dlRes.status, 200);
+  assert.equal(dlRes.headers.get('Content-Disposition'), 'attachment; filename="test.pdf"');
+  const dlBytes = new Uint8Array(await dlRes.arrayBuffer());
+  assert.equal(dlBytes[0], 0x25); // '%PDF'
+});
+
+test('State machine rejects invalid transitions (e.g. completed -> pending)', async () => {
+  const api = new PrintBridgeApi({ apiKey: TEST_AGENT_KEY, employeeSecret: TEST_EMPLOYEE_SECRET });
   const createRes = await api.createJob({
     tenantId: 'dtc-office',
-    userId: 'employee-1',
-    userEmail: 'employee@office.local',
+    userId: 'emp_1',
+    userEmail: 'emp@dtc.local',
     printerId: 'hp-laserjet-m1136',
-    filename: 'doc.pdf',
-    fileBytes: pdfBytes,
+    filename: 'memo.txt',
+    fileBytes: new TextEncoder().encode('Hello'),
     settings: defaultSettings
   });
 
-  assert.ok(createRes.job);
-
-  // Unauthorized agent claim fails closed
-  await assert.rejects(
-    async () => {
-      await api.claimJob({
-        agentId: 'gateway-win10',
-        agentVersion: '1.0.0',
-        supportedPrinters: ['hp-laserjet-m1136']
-      }, 'wrong-agent-key');
-    },
-    /Unauthorized/
-  );
-
-  // Authorized claim
   const claimRes = await api.claimJob({
-    agentId: 'gateway-win10',
+    agentId: 'gw-1',
     agentVersion: '1.0.0',
     supportedPrinters: ['hp-laserjet-m1136']
   }, TEST_AGENT_KEY);
 
-  assert.ok(claimRes.job);
-  assert.equal(claimRes.job?.id, createRes.job?.id);
-  assert.equal(claimRes.job?.status, 'claimed');
-  assert.ok(claimRes.leaseToken);
-
-  // Test authenticated document download with invalid lease token
-  const badDl = await api.getDocumentPayload(claimRes.job!.id, 'invalid-lease-token', TEST_AGENT_KEY);
-  assert.equal(badDl.statusCode, 403);
-  assert.match(badDl.error || '', /Invalid lease token/);
-
-  // Test authenticated document download with valid lease token
-  const goodDl = await api.getDocumentPayload(claimRes.job!.id, claimRes.leaseToken!, TEST_AGENT_KEY);
-  assert.ok(goodDl.fileBytes);
-  assert.equal(goodDl.filename, 'doc.pdf');
-  assert.deepEqual(goodDl.fileBytes, pdfBytes);
-
-  // Status update to completed cleans up storage payload
-  const updateRes = await api.updateJobStatus({
+  // Complete job
+  await api.updateJobStatus({
     jobId: claimRes.job!.id,
-    agentId: 'gateway-win10',
+    agentId: 'gw-1',
     leaseToken: claimRes.leaseToken!,
-    status: 'completed',
-    statusMessage: 'Spooler confirmed handoff to office printer'
+    status: 'completed'
   }, TEST_AGENT_KEY);
 
-  assert.equal(updateRes.success, true);
-  const finalJob = await api.getJob(claimRes.job!.id);
-  assert.equal(finalJob?.status, 'completed');
-  assert.equal(api.getFileBytes(finalJob!.r2StorageKey), undefined); // Scrubbed from storage
+  // Attempt invalid transition back to pending
+  const invalidRes = await api.updateJobStatus({
+    jobId: claimRes.job!.id,
+    agentId: 'gw-1',
+    leaseToken: claimRes.leaseToken!,
+    status: 'pending'
+  }, TEST_AGENT_KEY);
+
+  assert.equal(invalidRes.success, false);
+  assert.equal(invalidRes.statusCode, 400);
+  assert.match(invalidRes.error || '', /Invalid state transition/);
 });

@@ -16,22 +16,31 @@ Print Bridge is a secure, lightweight, unattended cloud-to-printer platform desi
 
 ---
 
-## 2. P0 Audit Hardening Applied
+## 2. P0 Audit Hardening Applied in Final Sprint
 
-1. **FileSandbox.cs Hardening**:
-   - Boundary checks now enforce exact root trailing separators, preventing sibling-prefix directory traversal (e.g. `/tmp/PrintBridgeTemp2` matching `/tmp/PrintBridgeTemp`).
+1. **Frontend & Backend Authentication Integration**:
+   - Web frontend now integrates with employee authentication bar and modal.
+   - Supports Cloudflare Access single sign-on via `Cf-Access-Authenticated-User-Email` header.
+   - Supports office PIN/passkey exchange via `POST /api/auth/session` with local session token storage (no secrets stored in public static assets).
+   - Secures all job-status inquiries (`GET /api/jobs/:id`) behind authorization headers and tenant isolation.
+2. **FileSandbox.cs Hardening**:
+   - Boundary checks enforce exact root trailing separators, preventing sibling-prefix directory traversal (e.g. `/tmp/PrintBridgeTemp2` matching `/tmp/PrintBridgeTemp`).
    - Strict alphanumeric/underscore regex validation on Job IDs (`^[a-zA-Z0-9_\-]+$`), rejecting empty, whitespace, `.`, `..`, and subpath strings.
    - Comprehensive ancestor directory walk inspecting for NTFS Reparse Points (symlinks and directory junctions) up to filesystem root.
    - Guard against sandbox root deletion: `SecureCleanup` asserts that target is an immediate child directory matching valid job naming and explicitly prevents deleting `_allowedRoot`.
-2. **Security & Authentication**:
+3. **Security & Authentication**:
    - Zero hardcoded fallback credentials. Fails closed with 401 Unauthorized if `PB_API_URL`, `PB_AGENT_KEY`, or `EMPLOYEE_AUTH_SECRET` are missing.
-   - Employee Bearer token validation required for creating print jobs.
    - Cryptographically secure random lease tokens generated via Web Crypto API, persisted via SHA-256 hashes, and verified on download and status reporting.
    - Dedicated authenticated document download endpoint: `GET /api/agent/jobs/:id/download`.
-3. **Database Concurrency & Object Retention**:
+4. **Database Concurrency & Object Retention**:
    - Cloudflare D1 SQL database support with atomic claim queries (`UPDATE print_jobs ... WHERE status='pending'`).
+   - Uses `meta.changes` to accurately detect affected rows in D1.
    - Cloudflare R2 object binding support with immediate deletion of storage payload upon completed spooler handoff.
    - Scheduled cron worker handler purging expired storage objects and abandoned jobs older than 24 hours.
+5. **Windows Agent Safety**:
+   - Dry-run mode (`--dry-run`) NEVER marks jobs as completed on the server; reports failed/dry-run notice so physical printing is never assumed complete.
+   - Missing or failed document downloads fail closed and update server accurately, never substituting fake bytes.
+   - Guard prevents raw spooling of unrendered binary documents to physical printers without an active rasterizer.
 
 ---
 
@@ -65,9 +74,9 @@ Print Bridge is a secure, lightweight, unattended cloud-to-printer platform desi
 TypeScript / Node Test Suites:
   ✔ tests/shared/shared.test.js (7/7 tests passed)
   ✔ tests/renderers/renderers.test.js (5/5 tests passed)
-  ✔ tests/api/api.test.js (4/4 tests passed)
+  ✔ tests/api/api.test.js (5/5 tests passed, including real Worker HTTP handlers)
   ✔ tests/e2e/e2e.test.js (1/1 test passed)
-  Total: 17 passed, 0 failed
+  Total: 18 passed, 0 failed
 
 .NET Agent Test Suite (including adversarial sandbox tests):
   ✔ FileSandbox_RestrictsAccessToAllowedRoot
@@ -76,19 +85,21 @@ TypeScript / Node Test Suites:
   ✔ FileSandbox_Adversarial_PreventsSandboxRootDeletion
   ✔ FileSandbox_SecureCleanup_RemovesJobDirectory
   ✔ MockSpooler_SubmitsAndRecordsSpoolJobs
-  ✔ AgentWorker_ProcessesJobInDryRun_CleanlyWipesWorkingDir
-  Total: 7 passed, 0 failed
+  ✔ AgentWorker_DryRunMode_DoesNotCompleteJobOnServer
+  ✔ AgentWorker_MissingDownloadUrl_FailsClosed
+  Total: 8 passed, 0 failed
 ```
 
 ---
 
-## 6. Prioritized Development Tasks for Google Antigravity
+## 6. Manual Setup & Next Steps for Google Antigravity
 
+See `docs/CLOUDFLARE_SETUP.md` for complete step-by-step instructions for manual Cloudflare resource creation (D1, R2, Access, Wrangler secrets).
+
+Next engineering tasks:
 1. **Integrate Native PDFium / Ghostscript rasterizer**:
    - Provide a C# wrapper for `pdfium.dll` on the Windows 10 gateway to render PDF pages directly to Windows `PrintDocument` GDI Graphics context.
 2. **Dual-Target .NET Framework 4.0/4.6.2**:
    - Update `PrintBridgeAgent.csproj` to cross-compile for legacy Windows 7 environments.
-3. **Deploy Cloudflare D1 & R2 Bindings**:
-   - Execute `npx wrangler d1 migrations apply print-bridge-d1` and bind production R2 bucket `print-bridge-documents`.
-4. **Deploy Headless LibreOffice Portable Bundle**:
+3. **Deploy Headless LibreOffice Portable Bundle**:
    - Optionally package portable LibreOffice on the Windows 10 gateway for Word, Excel, and PowerPoint rendering with macros disabled.

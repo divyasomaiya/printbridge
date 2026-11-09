@@ -53,7 +53,6 @@ public class AgentTests
         {
             var sandbox = new FileSandbox(allowedRoot);
 
-            // Trying to assert or access the sibling directory must fail closed
             Assert.Throws<UnauthorizedAccessException>(() =>
             {
                 sandbox.AssertPathSafe(siblingBypassPath);
@@ -107,11 +106,8 @@ public class AgentTests
 
         try
         {
-            // Direct attempt to cleanup the sandbox root itself
             Assert.Throws<UnauthorizedAccessException>(() => sandbox.SecureCleanup(tempRoot));
             Assert.Throws<UnauthorizedAccessException>(() => sandbox.SecureCleanup(tempRoot + Path.DirectorySeparatorChar));
-
-            // Attempt to clean up parent or sibling
             Assert.Throws<UnauthorizedAccessException>(() => sandbox.SecureCleanup(Path.GetDirectoryName(tempRoot)!));
         }
         finally
@@ -164,7 +160,7 @@ public class AgentTests
     }
 
     [Fact]
-    public async Task AgentWorker_ProcessesJobInDryRun_CleanlyWipesWorkingDir()
+    public async Task AgentWorker_DryRunMode_DoesNotCompleteJobOnServer()
     {
         var tempRoot = Path.Combine(Path.GetTempPath(), "pb_worker_test_" + Guid.NewGuid());
         var mockSpooler = new MockSpooler();
@@ -188,9 +184,49 @@ public class AgentTests
         bool processed = await worker.ProcessNextJobAsync();
         Assert.True(processed);
 
+        // In dry run mode, spool submission is skipped
+        Assert.Empty(mockSpooler.SpooledJobs);
+
+        // Verify status reported was failed/dry-run, NEVER "completed"
+        Assert.NotNull(mockHandler.LastReportedStatus);
+        Assert.NotEqual("completed", mockHandler.LastReportedStatus);
+
         // Verify temp directory cleaned up
         var remainingDirs = Directory.GetDirectories(tempRoot);
         Assert.Empty(remainingDirs);
+
+        if (Directory.Exists(tempRoot))
+        {
+            Directory.Delete(tempRoot, true);
+        }
+    }
+
+    [Fact]
+    public async Task AgentWorker_MissingDownloadUrl_FailsClosed()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "pb_dl_fail_test_" + Guid.NewGuid());
+        var mockSpooler = new MockSpooler();
+
+        var mockHandler = new MockHttpMessageHandler { ProvideDownloadUrl = false };
+        var httpClient = new HttpClient(mockHandler) { BaseAddress = new Uri("http://mock-api.local") };
+
+        var config = new AgentConfig(
+            ApiBaseUrl: "http://mock-api.local",
+            AgentKey: "test-key-configured",
+            AgentId: "test-agent",
+            TargetPrinterUncPath: @"\\OFFICE-HOST\HP_LaserJet_M1136",
+            TempDirectory: tempRoot,
+            PollIntervalSeconds: 1,
+            DryRun: false,
+            MockPrinter: true
+        );
+
+        var worker = new AgentWorker(config, mockSpooler, httpClient);
+
+        bool processed = await worker.ProcessNextJobAsync();
+        Assert.False(processed);
+        Assert.Equal("failed", mockHandler.LastReportedStatus);
+        Assert.Contains("download URL", mockHandler.LastReportedMessage ?? "");
 
         if (Directory.Exists(tempRoot))
         {
@@ -201,11 +237,16 @@ public class AgentTests
 
 public class MockHttpMessageHandler : HttpMessageHandler
 {
+    public bool ProvideDownloadUrl { get; set; } = true;
+    public string? LastReportedStatus { get; private set; }
+    public string? LastReportedMessage { get; private set; }
+
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         if (request.RequestUri?.AbsolutePath == "/api/agent/claim")
         {
-            var json = """
+            var dlUrl = ProvideDownloadUrl ? "/api/agent/jobs/job_test_001/download?leaseToken=lease_token_123" : "";
+            var json = $$"""
             {
               "job": {
                 "id": "job_test_001",
@@ -224,7 +265,7 @@ public class MockHttpMessageHandler : HttpMessageHandler
                 "updatedAt": 1715000000
               },
               "leaseToken": "lease_token_123",
-              "downloadUrl": ""
+              "downloadUrl": "{{dlUrl}}"
             }
             """;
             return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK)
@@ -233,8 +274,27 @@ public class MockHttpMessageHandler : HttpMessageHandler
             });
         }
 
+        if (request.RequestUri?.AbsolutePath.EndsWith("/download") == true)
+        {
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(new byte[] { 0x25, 0x50, 0x44, 0x46, 0x2D })
+            });
+        }
+
         if (request.RequestUri?.AbsolutePath == "/api/agent/status")
         {
+            var body = request.Content?.ReadAsStringAsync().Result ?? "";
+            using var doc = System.Text.Json.JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("status", out var s))
+            {
+                LastReportedStatus = s.GetString();
+            }
+            if (doc.RootElement.TryGetProperty("statusMessage", out var m))
+            {
+                LastReportedMessage = m.GetString();
+            }
+
             return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK)
             {
                 Content = new StringContent("{\"success\":true}", Encoding.UTF8, "application/json")

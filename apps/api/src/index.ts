@@ -5,6 +5,7 @@ import {
   ClaimJobRequest,
   ClaimJobResponse,
   UpdateJobStatusRequest,
+  JobStatus,
   HP_LASERJET_M1136_CAPABILITY,
   MOCK_PRINTER_CAPABILITY,
   validatePrintSettings,
@@ -15,6 +16,7 @@ import {
 export interface Env {
   DB?: any;      // Cloudflare D1 database binding
   STORAGE?: any; // Cloudflare R2 bucket binding
+  ASSETS?: any;  // Workers Static Assets binding
   ENVIRONMENT?: string;
   GATEWAY_API_KEY?: string;
   EMPLOYEE_AUTH_SECRET?: string;
@@ -47,27 +49,53 @@ export function generateSecureToken(prefix = 'tok'): string {
   return `${prefix}_${randomHex}`;
 }
 
+const ALLOWED_STATUS_TRANSITIONS: Record<JobStatus, JobStatus[]> = {
+  pending: ['claimed', 'cancelled'],
+  claimed: ['rendering', 'spooling', 'completed', 'failed', 'cancelled'],
+  rendering: ['spooling', 'completed', 'failed', 'cancelled'],
+  spooling: ['completed', 'failed', 'cancelled'],
+  completed: [], // Terminal
+  failed: [],    // Terminal
+  cancelled: [], // Terminal
+  expired: []    // Terminal
+};
+
 export class PrintBridgeApi {
-  // In-memory fallback datastore for testing or edge environments without D1/R2 bindings
   private jobs: Map<string, PrintJob> = new Map();
   private leaseHashes: Map<string, string> = new Map(); // jobId -> sha256(leaseToken)
   private storage: Map<string, Uint8Array> = new Map();
   private printers: Map<string, PrinterCapability> = new Map();
   private gatewayApiKey?: string;
   private employeeAuthSecret?: string;
+  private defaultTenantId: string = 'dtc-office';
   private db?: any;
   private r2?: any;
+  private isProduction: boolean = false;
 
   constructor(options?: {
     apiKey?: string;
     employeeSecret?: string;
+    tenantId?: string;
     db?: any;
     r2?: any;
+    isProduction?: boolean;
   }) {
     if (options?.apiKey) this.gatewayApiKey = options.apiKey;
     if (options?.employeeSecret) this.employeeAuthSecret = options.employeeSecret;
+    if (options?.tenantId) this.defaultTenantId = options.tenantId;
     if (options?.db) this.db = options.db;
     if (options?.r2) this.r2 = options.r2;
+    this.isProduction = options?.isProduction ?? false;
+
+    // In production mode, require real D1 and R2 bindings
+    if (this.isProduction) {
+      if (!this.db) {
+        throw new Error('PRODUCTION MISCONFIGURATION: Cloudflare D1 database binding "DB" is required.');
+      }
+      if (!this.r2) {
+        throw new Error('PRODUCTION MISCONFIGURATION: Cloudflare R2 bucket binding "STORAGE" is required.');
+      }
+    }
 
     this.printers.set(HP_LASERJET_M1136_CAPABILITY.id, HP_LASERJET_M1136_CAPABILITY);
     this.printers.set(MOCK_PRINTER_CAPABILITY.id, MOCK_PRINTER_CAPABILITY);
@@ -75,12 +103,26 @@ export class PrintBridgeApi {
 
   /**
    * Validates employee authorization for document submission.
-   * Fails closed: if no valid employee token is provided, access is denied.
+   * Supports Cloudflare Access identity header (Cf-Access-Authenticated-User-Email)
+   * or Bearer token matching EMPLOYEE_AUTH_SECRET.
    */
-  authenticateEmployee(authHeader?: string | null): AuthContext {
+  authenticateEmployee(headers: Headers): AuthContext {
+    // 1. Check for Cloudflare Access authenticated header
+    const cfEmail = headers.get('Cf-Access-Authenticated-User-Email');
+    if (cfEmail) {
+      return {
+        userId: cfEmail,
+        userEmail: cfEmail,
+        tenantId: this.defaultTenantId
+      };
+    }
+
+    // 2. Check for office passkey/secret Bearer token
     if (!this.employeeAuthSecret) {
       throw new Error('Server authentication configuration missing: EMPLOYEE_AUTH_SECRET not set.');
     }
+
+    const authHeader = headers.get('Authorization');
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       throw new Error('Unauthorized: Missing or invalid Authorization header.');
     }
@@ -93,8 +135,21 @@ export class PrintBridgeApi {
     return {
       userId: 'emp_authorized',
       userEmail: 'employee@office.local',
-      tenantId: 'dtc-office'
+      tenantId: this.defaultTenantId
     };
+  }
+
+  /**
+   * Session authentication endpoint: Exchanges valid employee PIN with session token
+   */
+  exchangeSession(passkey: string): { success: boolean; token?: string; error?: string } {
+    if (!this.employeeAuthSecret) {
+      return { success: false, error: 'Server authentication secret not configured.' };
+    }
+    if (passkey !== this.employeeAuthSecret) {
+      return { success: false, error: 'Invalid office passkey.' };
+    }
+    return { success: true, token: this.employeeAuthSecret };
   }
 
   /**
@@ -240,7 +295,6 @@ export class PrintBridgeApi {
     const leaseExpiresAt = now + leaseDuration;
 
     if (this.db) {
-      // Atomic claim in D1 using transactional UPDATE where status is pending or expired
       const printerPlaceholders = req.supportedPrinters.map(() => '?').join(',');
       const candidate = await this.db.prepare(`
         SELECT id FROM print_jobs
@@ -256,6 +310,7 @@ export class PrintBridgeApi {
       const leaseToken = generateSecureToken('lease');
       const leaseHash = await sha256Hex(leaseToken);
 
+      // In Cloudflare D1, affected rows count is available under meta.changes
       const updateRes = await this.db.prepare(`
         UPDATE print_jobs
         SET status = 'claimed',
@@ -270,8 +325,9 @@ export class PrintBridgeApi {
         `Job claimed by agent ${req.agentId}`, candidate.id, now
       ).run();
 
-      if (updateRes.changes === 0) {
-        return { job: null }; // raced by another worker
+      const affected = updateRes?.meta?.changes ?? updateRes?.changes ?? 0;
+      if (affected === 0) {
+        return { job: null }; // Raced by another gateway worker
       }
 
       const job = await this.getJob(candidate.id);
@@ -335,8 +391,8 @@ export class PrintBridgeApi {
       return { error: 'Job not found.', statusCode: 404 };
     }
 
-    if (job.status !== 'claimed') {
-      return { error: 'Job is not in claimed state.', statusCode: 403 };
+    if (job.status !== 'claimed' && job.status !== 'rendering' && job.status !== 'spooling') {
+      return { error: `Job is in status '${job.status}', not in a downloadable state.`, statusCode: 403 };
     }
 
     const now = Date.now();
@@ -361,7 +417,7 @@ export class PrintBridgeApi {
     let fileBytes: Uint8Array | undefined;
     if (this.r2) {
       const r2Obj = await this.r2.get(job.r2StorageKey);
-      if (!r2Obj) return { error: 'Storage object not found.', statusCode: 404 };
+      if (!r2Obj) return { error: 'Storage object not found in R2.', statusCode: 404 };
       fileBytes = new Uint8Array(await r2Obj.arrayBuffer());
     } else {
       fileBytes = this.storage.get(job.r2StorageKey);
@@ -388,6 +444,17 @@ export class PrintBridgeApi {
     const job = await this.getJob(req.jobId);
     if (!job) {
       return { success: false, error: 'Job not found.', statusCode: 404 };
+    }
+
+    // Agent ownership check: ensure this agent claimed the job
+    if (job.claimedByAgentId && job.claimedByAgentId !== req.agentId) {
+      return { success: false, error: 'Agent ownership mismatch: job was claimed by a different agent.', statusCode: 403 };
+    }
+
+    // Allowed status transitions
+    const validNextStates = ALLOWED_STATUS_TRANSITIONS[job.status] || [];
+    if (!validNextStates.includes(req.status)) {
+      return { success: false, error: `Invalid state transition from '${job.status}' to '${req.status}'.`, statusCode: 400 };
     }
 
     // Verify lease token hash
@@ -420,12 +487,16 @@ export class PrintBridgeApi {
       if (completedAt) job.completedAt = completedAt;
     }
 
-    // If completed, securely scrub payload from storage immediately
+    // If completed or failed, securely scrub payload from storage
     if (req.status === 'completed') {
-      if (this.r2) {
-        await this.r2.delete(job.r2StorageKey);
-      } else {
-        this.storage.delete(job.r2StorageKey);
+      try {
+        if (this.r2) {
+          await this.r2.delete(job.r2StorageKey);
+        } else {
+          this.storage.delete(job.r2StorageKey);
+        }
+      } catch (delErr) {
+        console.error('Storage deletion error:', delErr);
       }
     }
 
@@ -447,7 +518,11 @@ export class PrintBridgeApi {
 
       for (const row of expiredJobs.results ?? []) {
         if (this.r2 && row.r2_storage_key) {
-          await this.r2.delete(row.r2_storage_key);
+          try {
+            await this.r2.delete(row.r2_storage_key);
+          } catch (e) {
+            console.error('R2 cleanup error:', e);
+          }
         }
         await this.db.prepare('DELETE FROM print_jobs WHERE id = ?').bind(row.id).run();
         count++;
@@ -474,21 +549,46 @@ export class PrintBridgeApi {
 /**
  * Cloudflare Worker fetch & scheduled entrypoint
  */
+// Singleton or persistent API instance cache per environment in dev/test
+let cachedDevApi: PrintBridgeApi | null = null;
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    const api = new PrintBridgeApi({
-      apiKey: env.GATEWAY_API_KEY,
-      employeeSecret: env.EMPLOYEE_AUTH_SECRET,
-      db: env.DB,
-      r2: env.STORAGE
-    });
+
+    // If request is not an API call, serve static frontend assets if ASSETS binding exists
+    if (!url.pathname.startsWith('/api') && env.ASSETS) {
+      return await env.ASSETS.fetch(request);
+    }
+
+    const isProd = env.ENVIRONMENT === 'production';
+    let api: PrintBridgeApi;
+    if (isProd || env.DB) {
+      api = new PrintBridgeApi({
+        apiKey: env.GATEWAY_API_KEY,
+        employeeSecret: env.EMPLOYEE_AUTH_SECRET,
+        tenantId: env.DEFAULT_TENANT_ID,
+        db: env.DB,
+        r2: env.STORAGE,
+        isProduction: isProd
+      });
+    } else {
+      if (!cachedDevApi) {
+        cachedDevApi = new PrintBridgeApi({
+          apiKey: env.GATEWAY_API_KEY,
+          employeeSecret: env.EMPLOYEE_AUTH_SECRET,
+          tenantId: env.DEFAULT_TENANT_ID,
+          isProduction: false
+        });
+      }
+      api = cachedDevApi;
+    }
 
     const headers = {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Agent-Key'
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Agent-Key, Cf-Access-Authenticated-User-Email'
     };
 
     if (request.method === 'OPTIONS') {
@@ -496,6 +596,16 @@ export default {
     }
 
     try {
+      // Exchange session token with employee passkey
+      if (url.pathname === '/api/auth/session' && request.method === 'POST') {
+        const body: any = await request.json();
+        const res = api.exchangeSession(body.passkey);
+        return new Response(JSON.stringify(res), {
+          status: res.success ? 200 : 401,
+          headers
+        });
+      }
+
       if (url.pathname === '/api/printers' && request.method === 'GET') {
         return new Response(JSON.stringify(api.getPrinters()), { headers });
       }
@@ -504,7 +614,7 @@ export default {
       if (url.pathname === '/api/jobs' && request.method === 'POST') {
         let authContext: AuthContext;
         try {
-          authContext = api.authenticateEmployee(request.headers.get('Authorization'));
+          authContext = api.authenticateEmployee(request.headers);
         } catch (authErr: any) {
           return new Response(JSON.stringify({ error: authErr.message }), { status: 401, headers });
         }
@@ -526,10 +636,17 @@ export default {
         });
       }
 
-      // Query job status (with cross-tenant check)
+      // Query job status (requires employee authentication and tenant isolation)
       if (url.pathname.startsWith('/api/jobs/') && request.method === 'GET') {
+        let authContext: AuthContext;
+        try {
+          authContext = api.authenticateEmployee(request.headers);
+        } catch (authErr: any) {
+          return new Response(JSON.stringify({ error: authErr.message }), { status: 401, headers });
+        }
+
         const jobId = url.pathname.replace('/api/jobs/', '');
-        const job = await api.getJob(jobId);
+        const job = await api.getJob(jobId, authContext.tenantId);
         if (!job) {
           return new Response(JSON.stringify({ error: 'Job not found.' }), { status: 404, headers });
         }
@@ -586,10 +703,12 @@ export default {
   },
 
   async scheduled(event: any, env: Env, ctx: any): Promise<void> {
+    const isProd = env.ENVIRONMENT === 'production';
     const api = new PrintBridgeApi({
       apiKey: env.GATEWAY_API_KEY,
       db: env.DB,
-      r2: env.STORAGE
+      r2: env.STORAGE,
+      isProduction: isProd
     });
     const res = await api.cleanupExpired();
     console.log(`[RETENTION_CRON] Cleaned up ${res.cleanedJobsCount} expired print jobs and temporary R2 documents.`);

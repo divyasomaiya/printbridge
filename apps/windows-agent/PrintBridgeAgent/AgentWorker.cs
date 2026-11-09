@@ -19,7 +19,10 @@ public class AgentWorker
         _sandbox = new FileSandbox(config.TempDirectory);
         _spooler = spooler ?? (config.MockPrinter ? new MockSpooler() : new WindowsSpooler());
         _httpClient = httpClient ?? new HttpClient { BaseAddress = new Uri(config.ApiBaseUrl) };
-        _httpClient.DefaultRequestHeaders.Add("X-Agent-Key", config.AgentKey);
+        if (!string.IsNullOrEmpty(config.AgentKey))
+        {
+            _httpClient.DefaultRequestHeaders.Add("X-Agent-Key", config.AgentKey);
+        }
     }
 
     public FileSandbox Sandbox => _sandbox;
@@ -89,25 +92,36 @@ public class AgentWorker
             {
                 var safeTargetFile = _sandbox.ResolveSafeFilePath(workingDir, filename);
 
-                // Download document safely (or mock bytes in dry-run)
-                if (_config.DryRun || string.IsNullOrEmpty(downloadUrl))
+                // Download document safely
+                if (string.IsNullOrEmpty(downloadUrl))
                 {
-                    await File.WriteAllBytesAsync(safeTargetFile, new byte[] { 0x25, 0x50, 0x44, 0x46, 0x2D }); // Mock PDF header
+                    // Fail closed if downloadUrl is missing: NEVER substitute fake bytes in production
+                    string dlError = "CRITICAL: API provided no download URL for claimed job.";
+                    Console.WriteLine($"[ERROR] {dlError}");
+                    await UpdateStatusAsync(jobId, leaseToken ?? "", "failed", dlError);
+                    return false;
                 }
-                else
+
+                var dlResponse = await _httpClient.GetAsync(downloadUrl);
+                if (!dlResponse.IsSuccessStatusCode)
                 {
-                    var fileBytes = await _httpClient.GetByteArrayAsync(downloadUrl);
-                    await File.WriteAllBytesAsync(safeTargetFile, fileBytes);
+                    string dlFailMsg = $"Failed to download document from storage: HTTP {dlResponse.StatusCode}";
+                    Console.WriteLine($"[ERROR] {dlFailMsg}");
+                    await UpdateStatusAsync(jobId, leaseToken ?? "", "failed", dlFailMsg);
+                    return false;
                 }
+
+                var fileBytes = await dlResponse.Content.ReadAsByteArrayAsync();
+                await File.WriteAllBytesAsync(safeTargetFile, fileBytes);
 
                 // Verify file size inside sandbox
                 var fileInfo = new FileInfo(safeTargetFile);
                 if (fileInfo.Length > 50 * 1024 * 1024)
                 {
-                    throw new InvalidOperationException($"File exceeds maximum safe size (50 MB).");
+                    throw new InvalidOperationException("File exceeds maximum safe size (50 MB).");
                 }
 
-                // Parse print settings if available in payload
+                // Parse print settings
                 var settings = new PrintSettings(1, "portrait", "a4", "all", null, "simplex", "grayscale", "fit", true, null, null);
                 if (jobElem.TryGetProperty("settings", out var sElem))
                 {
@@ -128,21 +142,32 @@ public class AgentWorker
 
                 var targetPrinter = _config.MockPrinter ? "MockPrinter" : _config.TargetPrinterUncPath;
 
+                // CRITICAL SAFETY CHECK:
+                // Dry-run mode must NEVER report a print job as 'completed' on the server.
+                if (_config.DryRun)
+                {
+                    string dryRunMessage = $"[DRY RUN] Verified job {jobId} ({filename}, {fileBytes.Length} bytes). Settings: Copies={settings.Copies}, Orientation={settings.Orientation}, Range={settings.PageRangeType}. Spool submission skipped.";
+                    Console.WriteLine(dryRunMessage);
+                    // Leave job as claimed or report failed with dry-run notice so physical printer is never assumed complete
+                    await UpdateStatusAsync(jobId, leaseToken ?? "", "failed", "Dry-run verification completed (physical printing intentionally skipped).");
+                    return true;
+                }
+
                 // CRITICAL PRINT ARCHITECTURE CHECK:
                 // RAW spooling requires pre-rendered printer-ready PDL (Page Description Language) streams
                 // such as PCL, PostScript, or Windows EMF. Sending raw PDF, Word, Excel, or image files
                 // directly to a GDI/RAW queue on an HP LaserJet M1136 will output raw ASCII garbage or error out.
                 //
                 // In this MVP foundation:
-                // - Text files are formatted into printable streams.
+                // - Only raw PCL or text formatted through driver can be sent directly to spooler.
                 // - Non-text binary documents (PDF, Office, Images) must be rendered via a dedicated rendering engine
-                //   (e.g., Ghostscript/PDFium/LibreOffice or GDI PrintDocument) into PCL6/raster before live physical spooling.
+                //   (e.g., PDFium/Ghostscript/LibreOffice or GDI PrintDocument) into PCL6/raster before live physical spooling.
                 // - If live physical printing is attempted without an active document rendering engine,
                 //   the job is rejected safely rather than wasting paper with garbage text.
 
                 bool isRawPrinterReady = format == "txt" || format == "pcl" || format == "raw";
 
-                if (!_config.DryRun && !isRawPrinterReady && !_config.MockPrinter)
+                if (!isRawPrinterReady && !_config.MockPrinter)
                 {
                     string renderLimitationNotice = $"FORMAT_NOT_RENDERED: Format '{format}' requires a configured rasterizer/engine (e.g. PDFium/Ghostscript/LibreOffice) to produce PCL for the HP LaserJet M1136. Raw bytes cannot be safely spooled to physical printer.";
                     Console.WriteLine($"[RENDER_CHECK] {renderLimitationNotice}");
@@ -151,13 +176,6 @@ public class AgentWorker
                 }
 
                 byte[] spoolPayload = await File.ReadAllBytesAsync(safeTargetFile);
-
-                if (_config.DryRun)
-                {
-                    Console.WriteLine($"[DRY RUN] Would submit {spoolPayload.Length} bytes to spooler for printer: {targetPrinter} (Copies: {settings.Copies}, Range: {settings.PageRangeType})");
-                    await UpdateStatusAsync(jobId, leaseToken ?? "", "completed", "Dry-run verification completed successfully.");
-                    return true;
-                }
 
                 // Submit to Spooler
                 var spoolRes = _spooler.SubmitSpoolJob(targetPrinter, $"PrintBridge_{jobId}_{filename}", spoolPayload, settings);

@@ -2,6 +2,11 @@ name = "print-bridge-api"
 main = "src/index.ts"
 compatibility_date = "2024-05-01"
 
+# Workers Static Assets configuration for single-origin web frontend
+[assets]
+directory = "../web/public"
+binding = "ASSETS"
+
 [vars]
 ENVIRONMENT = "production"
 DEFAULT_TENANT_ID = "dtc-office"
@@ -9,11 +14,11 @@ DEFAULT_TENANT_ID = "dtc-office"
 [[d1_databases]]
 binding = "DB"
 database_name = "print-bridge-d1"
-database_id = "mock-d1-id"
+database_id = "00000000-0000-0000-0000-000000000000" # Replace with real D1 database ID from wrangler d1 create
 
 [[r2_buckets]]
 binding = "STORAGE"
-bucket_name = "print-bridge-documents"
+bucket_name = "print-bridge-documents" # Replace with real R2 bucket name
 
 [triggers]
 crons = ["*/15 * * * *"] # Retention cleanup every 15 minutes
