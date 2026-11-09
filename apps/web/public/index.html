@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Print Bridge by DTC — Universal Cloud Printing</title>
+  <style>
+    :root {
+      --primary: #1e40af;
+      --primary-hover: #1d4ed8;
+      --bg: #f8fafc;
+      --card-bg: #ffffff;
+      --border: #e2e8f0;
+      --text: #0f172a;
+      --text-muted: #64748b;
+      --warning: #b45309;
+      --warning-bg: #fffbeb;
+      --success: #15803d;
+      --success-bg: #f0fdf4;
+      --danger: #b91c1c;
+      --danger-bg: #fef2f2;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      padding: 16px;
+    }
+
+    .container {
+      max-width: 680px;
+      margin: 0 auto;
+    }
+
+    header {
+      margin-bottom: 24px;
+      text-align: center;
+    }
+
+    header h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+
+    header p {
+      font-size: 0.875rem;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+      margin-bottom: 16px;
+    }
+
+    .dropzone {
+      border: 2px dashed #cbd5e1;
+      border-radius: 8px;
+      padding: 24px;
+      text-align: center;
+      background: #f8fafc;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    .dropzone.dragover {
+      border-color: var(--primary);
+      background: #eff6ff;
+    }
+
+    .dropzone svg {
+      width: 40px;
+      height: 40px;
+      color: var(--primary);
+      margin-bottom: 8px;
+    }
+
+    .dropzone p {
+      font-size: 0.875rem;
+      color: var(--text);
+      font-weight: 500;
+    }
+
+    .dropzone span {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+
+    .file-pill {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: #eff6ff;
+      border: 1px solid #bfdbfe;
+      border-radius: 6px;
+      padding: 8px 12px;
+      margin-top: 12px;
+      font-size: 0.875rem;
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    @media (max-width: 480px) {
+      .grid-2 {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .form-group {
+      margin-bottom: 16px;
+    }
+
+    .form-group label {
+      display: block;
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 6px;
+    }
+
+    select, input[type="text"], input[type="number"] {
+      width: 100%;
+      padding: 8px 12px;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      font-size: 0.875rem;
+      background: #ffffff;
+      color: var(--text);
+    }
+
+    select:focus, input:focus {
+      outline: 2px solid var(--primary);
+      outline-offset: -1px;
+    }
+
+    .alert {
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-size: 0.8125rem;
+      margin-bottom: 16px;
+    }
+
+    .alert-warning {
+      background: var(--warning-bg);
+      border: 1px solid #fde68a;
+      color: var(--warning);
+    }
+
+    .alert-success {
+      background: var(--success-bg);
+      border: 1px solid #bbf7d0;
+      color: var(--success);
+    }
+
+    .alert-danger {
+      background: var(--danger-bg);
+      border: 1px solid #fecaca;
+      color: var(--danger);
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      padding: 10px 16px;
+      font-size: 0.9375rem;
+      font-weight: 600;
+      border-radius: 6px;
+      border: none;
+      background: var(--primary);
+      color: white;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .btn:hover {
+      background: var(--primary-hover);
+    }
+
+    .btn:disabled {
+      background: #94a3b8;
+      cursor: not-allowed;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 0.6875rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      background: #e2e8f0;
+      color: #334155;
+    }
+
+    .status-box {
+      margin-top: 16px;
+      border-top: 1px solid var(--border);
+      padding-top: 16px;
+    }
+
+    .status-indicator {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.875rem;
+      font-weight: 600;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #94a3b8;
+    }
+    .dot.active {
+      background: #22c55e;
+      box-shadow: 0 0 8px rgba(34, 197, 94, 0.6);
+    }
+
+    .qr-section {
+      text-align: center;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-top: 16px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="6 9 6 2 18 2 18 9"></polyline>
+          <path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path>
+          <rect x="6" y="14" width="12" height="8"></rect>
+        </svg>
+        Print Bridge by DTC
+      </h1>
+      <p>Direct cloud-to-printer gateway for office documents</p>
+    </header>
+
+    <div class="card">
+      <div id="dropzone" class="dropzone">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+          <polyline points="17 8 12 3 7 8"></polyline>
+          <line x1="12" y1="3" x2="12" y2="15"></line>
+        </svg>
+        <p>Drop file here or tap to select</p>
+        <span>Supports PDF, Word, Excel, PowerPoint, Images, Text & Webpages</span>
+        <input type="file" id="fileInput" style="display: none;" accept=".pdf,.doc,.docx,.rtf,.xls,.xlsx,.csv,.ppt,.pptx,.jpg,.jpeg,.png,.bmp,.webp,.tif,.tiff,.txt,.html,.htm">
+      </div>
+
+      <div id="fileInfo" class="file-pill" style="display: none;">
+        <span id="fileNameDisplay">document.pdf</span>
+        <button id="removeFileBtn" style="background:none; border:none; color:#ef4444; font-size:1.1rem; cursor:pointer;">&times;</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="form-group">
+        <label for="printerSelect">Office Printer</label>
+        <select id="printerSelect">
+          <option value="hp-laserjet-m1136">HP LaserJet Professional M1136 MFP (SILVERTOUCH-PC)</option>
+          <option value="mock-printer-test">Diagnostic Mock Printer (Local Gateway)</option>
+        </select>
+      </div>
+
+      <div id="printerNotice" class="alert alert-warning" style="display: block;">
+        <strong>Notice:</strong> HP LaserJet M1136 is a monochrome printer. Duplex printing requires manual paper re-feeding and is not unattended.
+      </div>
+
+      <div class="grid-2">
+        <div class="form-group">
+          <label for="copiesInput">Copies</label>
+          <input type="number" id="copiesInput" min="1" max="99" value="1">
+        </div>
+
+        <div class="form-group">
+          <label for="orientationSelect">Orientation</label>
+          <select id="orientationSelect">
+            <option value="portrait">Portrait</option>
+            <option value="landscape">Landscape</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="form-group">
+          <label for="pageRangeSelect">Pages</label>
+          <select id="pageRangeSelect">
+            <option value="all">All Pages</option>
+            <option value="custom">Custom Range</option>
+            <option value="odd">Odd Pages Only</option>
+            <option value="even">Even Pages Only</option>
+          </select>
+        </div>
+
+        <div class="form-group" id="customRangeGroup" style="display: none;">
+          <label for="customRangeInput">Page Range (e.g. 1-5, 8)</label>
+          <input type="text" id="customRangeInput" placeholder="e.g. 1-3, 5">
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="form-group">
+          <label for="paperSizeSelect">Paper Size</label>
+          <select id="paperSizeSelect">
+            <option value="a4">A4</option>
+            <option value="letter">Letter</option>
+            <option value="legal">Legal</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label for="duplexSelect">Duplex / Sides</label>
+          <select id="duplexSelect">
+            <option value="simplex">Single-sided (Unattended)</option>
+            <option value="manual_duplex">Manual Duplex (Requires Attendant)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="form-group">
+          <label for="colorModeSelect">Color Mode</label>
+          <select id="colorModeSelect">
+            <option value="grayscale">Grayscale / Black & White</option>
+            <option value="color" disabled>Color (Not supported by HP M1136)</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label for="scalingSelect">Scaling</label>
+          <select id="scalingSelect">
+            <option value="fit">Fit to Printable Area</option>
+            <option value="actual">Actual Size (100%)</option>
+          </select>
+        </div>
+      </div>
+
+      <button id="submitJobBtn" class="btn" disabled>
+        Print Document
+      </button>
+
+      <div id="statusSection" class="status-box" style="display: none;">
+        <div class="status-indicator">
+          <div id="statusDot" class="dot active"></div>
+          <span id="statusText">Queued for printing...</span>
+        </div>
+        <p id="statusDetails" style="font-size: 0.8125rem; color: var(--text-muted); margin-top: 4px;">Connecting to Windows gateway...</p>
+      </div>
+    </div>
+
+    <div class="qr-section">
+      <p>Scan to print from mobile: <a href="#" id="mobileShareLink">https://print.dtc.local</a></p>
+      <p style="margin-top: 4px;">Secured by Cloudflare R2 & Windows Gateway • No email required</p>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

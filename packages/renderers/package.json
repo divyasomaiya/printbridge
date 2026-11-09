@@ -1,0 +1,14 @@
+{
+  "name": "@print-bridge/renderers",
+  "version": "1.0.0",
+  "description": "Modular document rendering adapters and security isolation pipeline",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@print-bridge/shared": "*"
+  }
+}
