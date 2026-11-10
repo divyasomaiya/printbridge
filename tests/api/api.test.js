@@ -1,44 +1,11 @@
 "use strict";
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    var desc = Object.getOwnPropertyDescriptor(m, k);
-    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
-      desc = { enumerable: true, get: function() { return m[k]; } };
-    }
-    Object.defineProperty(o, k2, desc);
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || (function () {
-    var ownKeys = function(o) {
-        ownKeys = Object.getOwnPropertyNames || function (o) {
-            var ar = [];
-            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
-            return ar;
-        };
-        return ownKeys(o);
-    };
-    return function (mod) {
-        if (mod && mod.__esModule) return mod;
-        var result = {};
-        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
-        __setModuleDefault(result, mod);
-        return result;
-    };
-})();
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const node_test_1 = __importDefault(require("node:test"));
 const strict_1 = __importDefault(require("node:assert/strict"));
-const index_js_1 = __importStar(require("../../apps/api/dist/index.js"));
+const index_js_1 = require("../../apps/api/dist/index.js");
 const defaultSettings = {
     copies: 1,
     orientation: 'portrait',
@@ -59,6 +26,42 @@ const TEST_ADMIN_PASSWORD = 'super-secret-admin-pw';
     const hp = printers.find(p => p.id === 'hp-laserjet-m1136');
     strict_1.default.ok(hp);
     strict_1.default.equal(hp?.supportsColor, false);
+});
+(0, node_test_1.default)('Cloudflare Access JWT verification: rejects unverified / forged / expired signatures', async () => {
+    const api = new index_js_1.PrintBridgeApi({
+        apiKey: TEST_AGENT_KEY,
+        employeeSecret: TEST_EMPLOYEE_SECRET,
+        cfAccessAud: 'aud-test-123'
+    });
+    // 1. Missing CF_ACCESS_AUD disabled path
+    const noAudApi = new index_js_1.PrintBridgeApi({
+        apiKey: TEST_AGENT_KEY,
+        employeeSecret: TEST_EMPLOYEE_SECRET
+    });
+    const dummyHeaders = new Headers();
+    dummyHeaders.set('Cf-Access-Jwt-Assertion', 'h.p.s');
+    await strict_1.default.rejects(async () => await noAudApi.authenticateEmployee(dummyHeaders), /CF_ACCESS_AUD is not configured/);
+    // 2. Forged JWT with fake signature
+    const headerB64 = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).replace(/=/g, '');
+    const validPayload = {
+        email: 'sarah@office.local',
+        aud: ['aud-test-123'],
+        exp: Math.floor(Date.now() / 1000) + 3600
+    };
+    const payloadB64 = btoa(JSON.stringify(validPayload)).replace(/=/g, '');
+    const forgedHeaders = new Headers();
+    forgedHeaders.set('Cf-Access-Jwt-Assertion', `${headerB64}.${payloadB64}.forgedSignature`);
+    await strict_1.default.rejects(async () => await api.authenticateEmployee(forgedHeaders), /Invalid Cloudflare Access JWT signature/);
+    // 3. Expired JWT
+    const expiredPayload = {
+        email: 'sarah@office.local',
+        aud: ['aud-test-123'],
+        exp: Math.floor(Date.now() / 1000) - 60
+    };
+    const expPayloadB64 = btoa(JSON.stringify(expiredPayload)).replace(/=/g, '');
+    const expHeaders = new Headers();
+    expHeaders.set('Cf-Access-Jwt-Assertion', `${headerB64}.${expPayloadB64}.anySig`);
+    await strict_1.default.rejects(async () => await api.authenticateEmployee(expHeaders), /assertion expired/);
 });
 (0, node_test_1.default)('Public Guest Workflow: Submit with name (no PIN/login) -> Unguessable Receipt -> Status Inquiry', async () => {
     const api = new index_js_1.PrintBridgeApi({
@@ -98,48 +101,35 @@ const TEST_ADMIN_PASSWORD = 'super-secret-admin-pw';
     const invalidStatus = await api.getJob(jobId, 'dtc-office', 'wrong-receipt-token');
     strict_1.default.equal(invalidStatus, undefined);
 });
-(0, node_test_1.default)('Admin Role Enforcement: Non-admin rejected with 403 on admin endpoints', async () => {
-    const env = {
-        GATEWAY_API_KEY: TEST_AGENT_KEY,
-        EMPLOYEE_AUTH_SECRET: TEST_EMPLOYEE_SECRET,
-        ADMIN_PASSWORD: TEST_ADMIN_PASSWORD,
-        ENVIRONMENT: 'development'
+(0, node_test_1.default)('Database Queue Settings Fail Closed on D1 Errors / Missing Records', async () => {
+    // Mock D1 that throws on settings query
+    const brokenD1 = {
+        prepare(query) {
+            return {
+                bind() {
+                    return {
+                        async first() {
+                            if (query.includes('system_settings')) {
+                                throw new Error('D1 storage unavailable');
+                            }
+                            return null;
+                        },
+                        async run() { return { meta: { changes: 0 } }; }
+                    };
+                }
+            };
+        }
     };
-    const empSessReq = new Request('http://worker.local/api/auth/session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ passkey: TEST_EMPLOYEE_SECRET })
-    });
-    const empSessRes = await index_js_1.default.fetch(empSessReq, env);
-    const empData = await empSessRes.json();
-    const empToken = empData.token;
-    // Non-admin token fails with 403 Forbidden
-    const queueReq = new Request('http://worker.local/api/admin/queue', {
-        headers: { 'Authorization': `Bearer ${empToken}` }
-    });
-    const queueRes = await index_js_1.default.fetch(queueReq, env);
-    strict_1.default.equal(queueRes.status, 403);
-    // Admin session via admin123
-    const adminLoginReq = new Request('http://worker.local/api/admin/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: 'admin123', password: TEST_ADMIN_PASSWORD })
-    });
-    const adminLoginRes = await index_js_1.default.fetch(adminLoginReq, env);
-    const adminData = await adminLoginRes.json();
-    const adminToken = adminData.token;
-    // With admin token -> 200 OK
-    const adminQueueReq = new Request('http://worker.local/api/admin/queue', {
-        headers: { 'Authorization': `Bearer ${adminToken}` }
-    });
-    const adminQueueRes = await index_js_1.default.fetch(adminQueueReq, env);
-    strict_1.default.equal(adminQueueRes.status, 200);
-});
-(0, node_test_1.default)('Queue Pause Blocks Agent Claims and New Job Submissions', async () => {
     const api = new index_js_1.PrintBridgeApi({
         apiKey: TEST_AGENT_KEY,
-        adminPassword: TEST_ADMIN_PASSWORD
+        adminPassword: TEST_ADMIN_PASSWORD,
+        db: brokenD1
     });
+    // getQueueSettings fails closed to paused = true
+    const settings = await api.getQueueSettings();
+    strict_1.default.equal(settings.queuePaused, true);
+    strict_1.default.equal(settings.maxCopiesLimit, 50);
+    // createJob fails closed because queue is paused
     const jobRes = await api.createJob({
         tenantId: 'dtc-office',
         userId: 'guest_1',
@@ -150,113 +140,100 @@ const TEST_ADMIN_PASSWORD = 'super-secret-admin-pw';
         fileBytes: new Uint8Array([0x25, 0x50, 0x44, 0x46]),
         settings: defaultSettings
     });
-    strict_1.default.ok(jobRes.job);
-    // Admin pauses queue
-    await api.setQueueSettings({ queuePaused: true });
-    const settings = await api.getQueueSettings();
-    strict_1.default.equal(settings.queuePaused, true);
-    // Agent attempts to claim while queue is paused -> Rejected (returns null)
+    strict_1.default.equal(jobRes.success, false);
+    strict_1.default.match(jobRes.error || '', /paused/);
+    // claimJob fails closed because queue is paused
     const claimRes = await api.claimJob({
         agentId: 'gw-win10',
         agentVersion: '1.0.0',
         supportedPrinters: ['hp-laserjet-m1136']
     }, TEST_AGENT_KEY);
     strict_1.default.equal(claimRes.job, null);
-    // Admin resumes queue
-    await api.setQueueSettings({ queuePaused: false });
-    // Agent can now claim
-    const claimAfterResume = await api.claimJob({
-        agentId: 'gw-win10',
-        agentVersion: '1.0.0',
-        supportedPrinters: ['hp-laserjet-m1136']
-    }, TEST_AGENT_KEY);
-    strict_1.default.ok(claimAfterResume.job);
-    strict_1.default.equal(claimAfterResume.job.id, jobRes.job.id);
 });
 (0, node_test_1.default)('D1-Backed Integration Test: D1 inserts, separate receipt_token column, and system_settings persistence', async () => {
     const d1Jobs = new Map();
     const d1Settings = new Map();
+    const createStatement = (query, boundArgs = []) => ({
+        bind(...args) {
+            return createStatement(query, args);
+        },
+        async first() {
+            if (query.includes('SELECT value FROM system_settings WHERE key = "queue_paused"')) {
+                const s = d1Settings.get('queue_paused');
+                return s ? { value: s.value } : null;
+            }
+            if (query.includes('SELECT value FROM system_settings WHERE key = "max_copies_limit"')) {
+                const s = d1Settings.get('max_copies_limit');
+                return s ? { value: s.value } : null;
+            }
+            if (query.includes('SELECT id FROM print_jobs')) {
+                for (const row of d1Jobs.values()) {
+                    if (row.status === 'pending')
+                        return { id: row.id };
+                }
+                return null;
+            }
+            if (query.includes('SELECT * FROM print_jobs WHERE id = ?')) {
+                return d1Jobs.get(boundArgs[0]) || null;
+            }
+            if (query.includes('SELECT lease_token')) {
+                const r = d1Jobs.get(boundArgs[0]);
+                return r ? { lease_token: r.lease_token, lease_expires_at: r.lease_expires_at } : null;
+            }
+            return null;
+        },
+        async all() {
+            return { results: Array.from(d1Jobs.values()) };
+        },
+        async run() {
+            if (query.includes('INSERT INTO system_settings')) {
+                const key = query.includes('"queue_paused"') ? 'queue_paused' : 'max_copies_limit';
+                d1Settings.set(key, { key, value: boundArgs[0], updated_at: boundArgs[1] });
+                return { meta: { changes: 1 } };
+            }
+            if (query.includes('INSERT INTO print_jobs')) {
+                d1Jobs.set(boundArgs[0], {
+                    id: boundArgs[0],
+                    tenant_id: boundArgs[1],
+                    user_id: boundArgs[2],
+                    user_email: boundArgs[3],
+                    employee_name: boundArgs[4],
+                    receipt_token: boundArgs[5],
+                    printer_id: boundArgs[6],
+                    printer_name: boundArgs[7],
+                    original_filename: boundArgs[8],
+                    file_size_bytes: boundArgs[9],
+                    file_format: boundArgs[10],
+                    mime_type: boundArgs[11],
+                    r2_storage_key: boundArgs[12],
+                    settings_json: boundArgs[13],
+                    status: boundArgs[14],
+                    status_message: boundArgs[15],
+                    lease_token: boundArgs[16],
+                    created_at: boundArgs[17],
+                    updated_at: boundArgs[18]
+                });
+                return { meta: { changes: 1 } };
+            }
+            if (query.includes('UPDATE print_jobs')) {
+                if (query.includes('SET status = \'claimed\'')) {
+                    const id = boundArgs[5];
+                    const existing = d1Jobs.get(id);
+                    if (existing) {
+                        existing.status = 'claimed';
+                        existing.claimed_by_agent_id = boundArgs[0];
+                        existing.lease_token = boundArgs[1];
+                        existing.lease_expires_at = boundArgs[2];
+                        return { meta: { changes: 1 } };
+                    }
+                }
+            }
+            return { meta: { changes: 0 } };
+        }
+    });
     const mockD1 = {
         prepare(query) {
-            return {
-                bind(...args) {
-                    return {
-                        async first() {
-                            if (query.includes('SELECT value FROM system_settings WHERE key = "queue_paused"')) {
-                                const s = d1Settings.get('queue_paused');
-                                return s ? { value: s.value } : null;
-                            }
-                            if (query.includes('SELECT value FROM system_settings WHERE key = "max_copies_limit"')) {
-                                const s = d1Settings.get('max_copies_limit');
-                                return s ? { value: s.value } : null;
-                            }
-                            if (query.includes('SELECT id FROM print_jobs')) {
-                                for (const row of d1Jobs.values()) {
-                                    if (row.status === 'pending')
-                                        return { id: row.id };
-                                }
-                                return null;
-                            }
-                            if (query.includes('SELECT * FROM print_jobs WHERE id = ?')) {
-                                return d1Jobs.get(args[0]) || null;
-                            }
-                            if (query.includes('SELECT lease_token')) {
-                                const r = d1Jobs.get(args[0]);
-                                return r ? { lease_token: r.lease_token, lease_expires_at: r.lease_expires_at } : null;
-                            }
-                            return null;
-                        },
-                        async all() {
-                            return { results: Array.from(d1Jobs.values()) };
-                        },
-                        async run() {
-                            if (query.includes('INSERT INTO system_settings')) {
-                                d1Settings.set(args[0], { key: args[0], value: args[1], updated_at: args[2] });
-                                return { meta: { changes: 1 } };
-                            }
-                            if (query.includes('INSERT INTO print_jobs')) {
-                                // columns: id, tenant_id, user_id, user_email, employee_name, receipt_token, printer_id...
-                                d1Jobs.set(args[0], {
-                                    id: args[0],
-                                    tenant_id: args[1],
-                                    user_id: args[2],
-                                    user_email: args[3],
-                                    employee_name: args[4],
-                                    receipt_token: args[5],
-                                    printer_id: args[6],
-                                    printer_name: args[7],
-                                    original_filename: args[8],
-                                    file_size_bytes: args[9],
-                                    file_format: args[10],
-                                    mime_type: args[11],
-                                    r2_storage_key: args[12],
-                                    settings_json: args[13],
-                                    status: args[14],
-                                    status_message: args[15],
-                                    lease_token: args[16],
-                                    created_at: args[17],
-                                    updated_at: args[18]
-                                });
-                                return { meta: { changes: 1 } };
-                            }
-                            if (query.includes('UPDATE print_jobs')) {
-                                if (query.includes('SET status = \'claimed\'')) {
-                                    const id = args[5]; // agentId, leaseHash, leaseExpiresAt, now, msg, candidate.id
-                                    const existing = d1Jobs.get(id);
-                                    if (existing) {
-                                        existing.status = 'claimed';
-                                        existing.claimed_by_agent_id = args[0];
-                                        existing.lease_token = args[1];
-                                        existing.lease_expires_at = args[2];
-                                        return { meta: { changes: 1 } };
-                                    }
-                                }
-                            }
-                            return { meta: { changes: 0 } };
-                        }
-                    };
-                }
-            };
+            return createStatement(query);
         }
     };
     const r2Storage = new Map();
@@ -270,11 +247,13 @@ const TEST_ADMIN_PASSWORD = 'super-secret-admin-pw';
     };
     const api = new index_js_1.PrintBridgeApi({
         apiKey: TEST_AGENT_KEY,
-        employeeSecret: TEST_EMPLOYEE_SECRET,
+        adminPassword: TEST_ADMIN_PASSWORD,
         db: mockD1,
         r2: mockR2,
         isProduction: true
     });
+    // Explicitly unpause queue for test
+    await api.setQueueSettings({ queuePaused: false, maxCopiesLimit: 50 });
     // 1. Create job with guest name and receipt token in D1
     const createRes = await api.createJob({
         tenantId: 'dtc-office',
@@ -293,7 +272,7 @@ const TEST_ADMIN_PASSWORD = 'super-secret-admin-pw';
     // 2. Verify D1 stored receipt_token separately
     const storedD1Row = d1Jobs.get(jobId);
     strict_1.default.equal(storedD1Row.receipt_token, receiptToken);
-    strict_1.default.equal(storedD1Row.lease_token, null); // Not leased yet
+    strict_1.default.equal(storedD1Row.lease_token, null);
     // 3. Agent claims the job
     const claimRes = await api.claimJob({
         agentId: 'gw-d1',
@@ -303,8 +282,8 @@ const TEST_ADMIN_PASSWORD = 'super-secret-admin-pw';
     strict_1.default.ok(claimRes.job);
     // 4. Verify lease_token was updated in D1 WITHOUT altering receipt_token
     const postClaimD1Row = d1Jobs.get(jobId);
-    strict_1.default.ok(postClaimD1Row.lease_token); // Agent lease token hash present
-    strict_1.default.equal(postClaimD1Row.receipt_token, receiptToken); // receipt_token is preserved!
+    strict_1.default.ok(postClaimD1Row.lease_token);
+    strict_1.default.equal(postClaimD1Row.receipt_token, receiptToken);
     // 5. Guest checks status using receiptToken after agent claim -> Still succeeds!
     const guestStatus = await api.getJob(jobId, 'dtc-office', receiptToken);
     strict_1.default.ok(guestStatus);

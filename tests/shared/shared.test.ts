@@ -9,11 +9,16 @@ import {
   PrintSettings
 } from '../../packages/shared/dist/index.js';
 
-test('HP LaserJet M1136 capability profile validation', () => {
+test('HP LaserJet M1136 capability profile validation and UNC path escaping', () => {
   assert.equal(HP_LASERJET_M1136_CAPABILITY.supportsColor, false);
   assert.equal(HP_LASERJET_M1136_CAPABILITY.supportsAutoDuplex, false);
   assert.equal(HP_LASERJET_M1136_CAPABILITY.supportsManualDuplex, true);
   assert.equal(HP_LASERJET_M1136_CAPABILITY.host, 'SILVERTOUCH-PC');
+
+  // Verify runtime UNC path has exactly 2 leading backslashes and 1 separator backslash
+  assert.equal(HP_LASERJET_M1136_CAPABILITY.fullUncPath, '\\\\SILVERTOUCH-PC\\HP LaserJet Professional M1136 MFP');
+  assert.equal(HP_LASERJET_M1136_CAPABILITY.fullUncPath.startsWith('\\\\'), true);
+  assert.equal(HP_LASERJET_M1136_CAPABILITY.fullUncPath.startsWith('\\\\\\'), false);
 });
 
 test('validatePrintSettings rejects color on monochrome printer', () => {

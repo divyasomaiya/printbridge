@@ -144,11 +144,17 @@ export class PrintBridgeApi {
       try {
         const pausedRow = await this.db.prepare('SELECT value FROM system_settings WHERE key = "queue_paused"').first();
         const copiesRow = await this.db.prepare('SELECT value FROM system_settings WHERE key = "max_copies_limit"').first();
-        const isPaused = pausedRow ? pausedRow.value === 'true' : this.queuePaused;
-        const maxCopies = copiesRow ? parseInt(copiesRow.value, 10) : this.maxCopiesLimit;
+
+        // FAIL-CLOSED SAFETY:
+        // If settings record is missing from D1 in production, default queue to PAUSED.
+        const isPaused = pausedRow ? pausedRow.value === 'true' : true;
+        const maxCopies = copiesRow ? parseInt(copiesRow.value, 10) : 50;
         return { queuePaused: isPaused, maxCopiesLimit: isNaN(maxCopies) ? 50 : maxCopies };
-      } catch {
-        return { queuePaused: this.queuePaused, maxCopiesLimit: this.maxCopiesLimit };
+      } catch (dbErr) {
+        // FAIL-CLOSED SAFETY:
+        // Any database read failure must strictly fail closed (paused queue)
+        console.error('Failed to read system_settings from D1, failing closed:', dbErr);
+        return { queuePaused: true, maxCopiesLimit: 50 };
       }
     }
     return { queuePaused: this.queuePaused, maxCopiesLimit: this.maxCopiesLimit };
@@ -250,34 +256,62 @@ export class PrintBridgeApi {
     const accessJwt = headers.get('Cf-Access-Jwt-Assertion');
 
     if (accessJwt) {
-      const jwtParts = accessJwt.split('.');
-      if (jwtParts.length === 3) {
-        try {
-          const payloadJson = atob(jwtParts[1].replace(/-/g, '+').replace(/_/g, '/'));
-          const payload = JSON.parse(payloadJson);
-
-          const nowSec = Math.floor(Date.now() / 1000);
-          if (payload.exp && payload.exp < nowSec) {
-            throw new Error('Cloudflare Access JWT assertion expired.');
-          }
-
-          if (this.cfAccessAud && (!payload.aud || !payload.aud.includes(this.cfAccessAud))) {
-            throw new Error('Cloudflare Access JWT audience mismatch.');
-          }
-
-          const email = payload.email || headers.get('Cf-Access-Authenticated-User-Email');
-          if (email) {
-            return {
-              userId: email,
-              userEmail: email,
-              tenantId: this.defaultTenantId
-            };
-          }
-        } catch (jwtErr: any) {
-          throw new Error(`Cloudflare Access authentication failed: ${jwtErr.message}`);
-        }
+      // Secure Cloudflare Access verification requires a configured AUD and signing secret/certs.
+      // If CF_ACCESS_AUD is not configured, or if verification fails, fail closed.
+      if (!this.cfAccessAud) {
+        throw new Error('Cloudflare Access authentication path is disabled: CF_ACCESS_AUD is not configured on server.');
       }
-      throw new Error('Malformed Cf-Access-Jwt-Assertion.');
+
+      const jwtParts = accessJwt.split('.');
+      if (jwtParts.length !== 3) {
+        throw new Error('Malformed Cf-Access-Jwt-Assertion.');
+      }
+
+      const [headerB64, payloadB64, signatureB64] = jwtParts;
+      let payload: any;
+      try {
+        const payloadJson = atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/'));
+        payload = JSON.parse(payloadJson);
+      } catch {
+        throw new Error('Failed to parse Cf-Access-Jwt-Assertion payload.');
+      }
+
+      // Check expiration
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (!payload.exp || payload.exp < nowSec) {
+        throw new Error('Cloudflare Access JWT assertion expired.');
+      }
+
+      // Validate Audience Tag
+      const audClaim = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+      if (!audClaim.includes(this.cfAccessAud)) {
+        throw new Error('Cloudflare Access JWT audience mismatch.');
+      }
+
+      // Cryptographic signature check:
+      // When a shared secret or team verification secret is configured, verify HMAC signature.
+      // Otherwise, reject unverified signature to prevent forgery.
+      const verificationSecret = this.employeeAuthSecret || this.adminPassword;
+      if (!verificationSecret) {
+        throw new Error('Cloudflare Access JWT cryptographic verification key not configured.');
+      }
+
+      const signedData = `${headerB64}.${payloadB64}`;
+      const isValidSig = await verifyHmacSha256(verificationSecret, signedData, signatureB64);
+      if (!isValidSig) {
+        throw new Error('Invalid Cloudflare Access JWT signature.');
+      }
+
+      const email = payload.email;
+      if (!email) {
+        throw new Error('Cloudflare Access JWT contains no user email identity.');
+      }
+
+      return {
+        userId: email,
+        userEmail: email,
+        tenantId: this.defaultTenantId
+      };
     }
 
     const authHeader = headers.get('Authorization');

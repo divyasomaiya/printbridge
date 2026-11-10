@@ -6,11 +6,15 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const node_test_1 = __importDefault(require("node:test"));
 const strict_1 = __importDefault(require("node:assert/strict"));
 const index_js_1 = require("../../packages/shared/dist/index.js");
-(0, node_test_1.default)('HP LaserJet M1136 capability profile validation', () => {
+(0, node_test_1.default)('HP LaserJet M1136 capability profile validation and UNC path escaping', () => {
     strict_1.default.equal(index_js_1.HP_LASERJET_M1136_CAPABILITY.supportsColor, false);
     strict_1.default.equal(index_js_1.HP_LASERJET_M1136_CAPABILITY.supportsAutoDuplex, false);
     strict_1.default.equal(index_js_1.HP_LASERJET_M1136_CAPABILITY.supportsManualDuplex, true);
     strict_1.default.equal(index_js_1.HP_LASERJET_M1136_CAPABILITY.host, 'SILVERTOUCH-PC');
+    // Verify runtime UNC path has exactly 2 leading backslashes and 1 separator backslash
+    strict_1.default.equal(index_js_1.HP_LASERJET_M1136_CAPABILITY.fullUncPath, '\\\\SILVERTOUCH-PC\\HP LaserJet Professional M1136 MFP');
+    strict_1.default.equal(index_js_1.HP_LASERJET_M1136_CAPABILITY.fullUncPath.startsWith('\\\\'), true);
+    strict_1.default.equal(index_js_1.HP_LASERJET_M1136_CAPABILITY.fullUncPath.startsWith('\\\\\\'), false);
 });
 (0, node_test_1.default)('validatePrintSettings rejects color on monochrome printer', () => {
     const settings = {

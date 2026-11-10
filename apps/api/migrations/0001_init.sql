@@ -92,7 +92,7 @@ INSERT OR IGNORE INTO printers (
     'HP LaserJet Professional M1136 MFP',
     'SILVERTOUCH-PC',
     'HP LaserJet Professional M1136 MFP',
-    '\\\\SILVERTOUCH-PC\\HP LaserJet Professional M1136 MFP',
+    '\\SILVERTOUCH-PC\HP LaserJet Professional M1136 MFP',
     1,
     0,
     0,
