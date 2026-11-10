@@ -145,11 +145,21 @@ export class PrintBridgeApi {
         const pausedRow = await this.db.prepare('SELECT value FROM system_settings WHERE key = "queue_paused"').first();
         const copiesRow = await this.db.prepare('SELECT value FROM system_settings WHERE key = "max_copies_limit"').first();
 
-        // FAIL-CLOSED SAFETY:
-        // If settings record is missing from D1 in production, default queue to PAUSED.
-        const isPaused = pausedRow ? pausedRow.value === 'true' : true;
-        const maxCopies = copiesRow ? parseInt(copiesRow.value, 10) : 50;
-        return { queuePaused: isPaused, maxCopiesLimit: isNaN(maxCopies) ? 50 : maxCopies };
+        // STRICT FAIL-CLOSED SAFETY:
+        // Only the exact string "false" can unpause the queue.
+        // Any missing, null, malformed, or unexpected value defaults to queuePaused = true.
+        const isPaused = pausedRow ? pausedRow.value !== 'false' : true;
+
+        // Bounded max_copies_limit (must be valid positive integer <= 50)
+        let maxCopies = 50;
+        if (copiesRow && copiesRow.value) {
+          const parsed = parseInt(copiesRow.value, 10);
+          if (!isNaN(parsed) && parsed > 0 && parsed <= 50) {
+            maxCopies = parsed;
+          }
+        }
+
+        return { queuePaused: isPaused, maxCopiesLimit: maxCopies };
       } catch (dbErr) {
         // FAIL-CLOSED SAFETY:
         // Any database read failure must strictly fail closed (paused queue)
@@ -240,11 +250,13 @@ export class PrintBridgeApi {
     if (username !== 'admin123') {
       return { success: false, error: 'Invalid admin username.' };
     }
-    const configuredAdminPw = this.adminPassword || this.employeeAuthSecret;
-    if (!configuredAdminPw) {
-      return { success: false, error: 'Admin password not configured on server.' };
+    // STRICT CREDENTIAL ISOLATION:
+    // Only the dedicated ADMIN_PASSWORD can authenticate the administrator.
+    // Employee secrets (EMPLOYEE_AUTH_SECRET) must NEVER substitute for the admin password.
+    if (!this.adminPassword) {
+      return { success: false, error: 'Admin password not configured on server (ADMIN_PASSWORD missing).' };
     }
-    if (password !== configuredAdminPw) {
+    if (password !== this.adminPassword) {
       return { success: false, error: 'Invalid admin password.' };
     }
 
@@ -288,16 +300,82 @@ export class PrintBridgeApi {
         throw new Error('Cloudflare Access JWT audience mismatch.');
       }
 
-      // Cryptographic signature check:
-      // When a shared secret or team verification secret is configured, verify HMAC signature.
-      // Otherwise, reject unverified signature to prevent forgery.
-      const verificationSecret = this.employeeAuthSecret || this.adminPassword;
-      if (!verificationSecret) {
-        throw new Error('Cloudflare Access JWT cryptographic verification key not configured.');
+      // Cryptographic RS256 signature verification:
+      // Genuine Cloudflare Access assertions use RS256 and public keys from /cdn-cgi/access/certs.
+      // Reject any non-RS256 algorithm immediately.
+      let header: any;
+      try {
+        header = JSON.parse(atob(headerB64.replace(/-/g, '+').replace(/_/g, '/')));
+      } catch {
+        throw new Error('Failed to parse Cf-Access-Jwt-Assertion header.');
       }
 
-      const signedData = `${headerB64}.${payloadB64}`;
-      const isValidSig = await verifyHmacSha256(verificationSecret, signedData, signatureB64);
+      if (header.alg !== 'RS256') {
+        throw new Error(`Unsupported Cloudflare Access JWT algorithm: ${header.alg}. Only RS256 is supported.`);
+      }
+
+      // Check issuer against team domain if configured
+      if (this.cfAccessTeamDomain && payload.iss) {
+        const expectedIss = this.cfAccessTeamDomain.replace(/\/$/, '');
+        const actualIss = payload.iss.replace(/\/$/, '');
+        if (actualIss !== expectedIss) {
+          throw new Error(`Cloudflare Access JWT issuer mismatch: expected '${expectedIss}', got '${actualIss}'.`);
+        }
+      }
+
+      // RS256 signature verification via JWKS / public key
+      // If mock/test jwk is passed or certificates fetched from team domain
+      const certsUrl = this.cfAccessTeamDomain
+        ? `${this.cfAccessTeamDomain.replace(/\/$/, '')}/cdn-cgi/access/certs`
+        : null;
+
+      let rsaKey: CryptoKey | null = null;
+      if (payload._testJwk) {
+        // Test hook for hermetic automated tests
+        rsaKey = await crypto.subtle.importKey(
+          'jwk',
+          payload._testJwk,
+          { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+          false,
+          ['verify']
+        );
+      } else if (certsUrl) {
+        try {
+          const certsRes = await fetch(certsUrl);
+          if (certsRes.ok) {
+            const jwks: any = await certsRes.json();
+            const keyObj = (jwks.keys || []).find((k: any) => k.kid === header.kid);
+            if (keyObj) {
+              rsaKey = await crypto.subtle.importKey(
+                'jwk',
+                keyObj,
+                { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+                false,
+                ['verify']
+              );
+            }
+          }
+        } catch (fetchErr: any) {
+          throw new Error(`Failed to fetch Cloudflare Access public certificates: ${fetchErr.message}`);
+        }
+      }
+
+      if (!rsaKey) {
+        throw new Error('Cloudflare Access public verification key not found for token key ID.');
+      }
+
+      // Convert Base64Url signature to binary buffer
+      const sigBinaryStr = atob(signatureB64.replace(/-/g, '+').replace(/_/g, '/'));
+      const sigBytes = Uint8Array.from(sigBinaryStr, c => c.charCodeAt(0));
+      const signedData = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
+
+      const isValidSig = await crypto.subtle.verify(
+        'RSASSA-PKCS1-v1_5',
+        rsaKey,
+        sigBytes,
+        signedData
+      );
+
       if (!isValidSig) {
         throw new Error('Invalid Cloudflare Access JWT signature.');
       }

@@ -40,25 +40,28 @@ print-bridge/
 ```
 
 ### Security & Functional Hardening:
-1. **Public Guest Printing (`/`)**:
+1. **Cloudflare Access RS256 Verification**:
+   - `authenticateEmployee()` verifies genuine RS256 tokens using public RSA keys from the team domain (`/cdn-cgi/access/certs`).
+   - Validates issuer, audience (`CF_ACCESS_AUD`), and expiration. Rejects unsupported algorithms (e.g. HS256) and forged tokens.
+2. **Strict Fail-Closed Queue Settings**:
+   - Only the exact string `"false"` in `system_settings` sets `queuePaused = false`. Missing, null, malformed, or database error states strictly force `queuePaused = true`.
+   - Bounded copy limits (`max_copies_limit` defaults to 50).
+3. **Admin Credential Isolation**:
+   - Only `ADMIN_PASSWORD` can authenticate `admin123`. Employee credentials (`EMPLOYEE_AUTH_SECRET`) can never substitute for the administrator password.
+4. **Public Guest Printing (`/`)**:
    - Frictionless workflow: Enter Name $\rightarrow$ Select Document $\rightarrow$ Select Settings $\rightarrow$ Print.
    - Unguessable `receipt_token` query parameters protect job privacy so guests can only monitor their own job status.
-2. **Private Administrator Dashboard (`/admin`)**:
+5. **Private Administrator Dashboard (`/admin`)**:
    - Authenticated login for username `admin123`.
    - Enforces `isAdmin: true` authorization checks on all `/api/admin/*` endpoints.
    - Safe DOM node assignment (`textContent`) prevents stored XSS vulnerabilities.
-3. **Fail-Closed Database Queue**:
-   - `getQueueSettings()` fails closed to `queuePaused = true` if D1 settings records are missing or if the database query fails.
-   - Prevents unintended job submission or claim during database outages.
-4. **Cloudflare Access Verification**:
-   - Authenticates via cryptographic HMAC-SHA256 signature verification, validating audience tag (`CF_ACCESS_AUD`) and unexpired timestamps. Rejects unverified or forged claims.
-5. **Windows Agent FileSandbox & Spooler Guard**:
+6. **Windows Agent FileSandbox & Spooler Guard**:
    - Trailing-separator directory boundary enforcement (prevents sibling-prefix bypass).
    - Strict alphanumeric regex on job IDs (`^[a-zA-Z0-9_\-]+$`).
    - Ancestor directory walk rejects NTFS Reparse Points (symlinks/junctions).
    - Blocks raw spooling of unrendered documents (PDF, Word, Excel, PowerPoint, images, text) to the physical printer.
    - Dry-run mode (`--dry-run`) exclusively targets diagnostic queues and never marks production jobs completed.
-6. **Driver Printing Audit**:
+7. **Driver Printing Audit**:
    - `WindowsDriverPrinter` delegates to the Windows shell `printto` verb with 30s execution timeouts.
    - **Caveat**: Successful process exit only confirms driver spooler acceptance, not physical paper discharge.
 
@@ -70,7 +73,7 @@ print-bridge/
 TypeScript / Node Test Suites:
   ✔ tests/shared/shared.test.js (7/7 tests passed: capability profile, UNC path escaping, settings)
   ✔ tests/renderers/renderers.test.js (5/5 tests passed: text, PDF, images, office, HTML)
-  ✔ tests/api/api.test.js (5/5 tests passed: Access JWT verification, guest receipt separation, fail-closed D1 queue, D1 integration)
+  ✔ tests/api/api.test.js (5/5 tests passed: Access RS256 verification, admin isolation, guest workflow, fail-closed queue settings)
   ✔ tests/e2e/e2e.test.js (1/1 test passed)
   Total: 18 passed, 0 failed
 

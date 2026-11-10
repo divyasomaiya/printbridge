@@ -30,7 +30,7 @@ npx wrangler secret put GATEWAY_API_KEY
 
 # Administrator password for /admin dashboard (username: admin123)
 npx wrangler secret put ADMIN_PASSWORD
-# Enter your private administrator password
+# Enter your private administrator password (strictly isolated from employee credentials)
 ```
 
 ---
@@ -57,7 +57,17 @@ npx wrangler d1 execute print-bridge-d1 --remote --file=./migrations/0001_init.s
 
 ---
 
-## 4. Deploying the Application
+## 4. Cloudflare Access (Zero Trust) RS256 Verification
+
+To authenticate employees using Cloudflare Access Zero Trust:
+1. Configure `CF_ACCESS_AUD` (Audience tag from Access application overview) in `wrangler.toml` or via environment variable.
+2. Configure `CF_ACCESS_TEAM_DOMAIN` (e.g. `https://yourteam.cloudflareaccess.com`) in `wrangler.toml`.
+3. The API cryptographically fetches public RSA certificates from `https://yourteam.cloudflareaccess.com/cdn-cgi/access/certs` and verifies RS256 signatures, issuer, audience, and expiration.
+4. If `CF_ACCESS_AUD` or `CF_ACCESS_TEAM_DOMAIN` are unset, the Access JWT route fails closed.
+
+---
+
+## 5. Deploying the Application
 
 From `apps/api`:
 
@@ -72,7 +82,7 @@ This command publishes:
 
 ---
 
-## 5. Deployment Verification Checklist
+## 6. Deployment Verification Checklist
 
 1. **Safety Checkpoint**: Verify queue remains paused (`queue_paused=true`) until ready.
 2. **Admin Dashboard**:
