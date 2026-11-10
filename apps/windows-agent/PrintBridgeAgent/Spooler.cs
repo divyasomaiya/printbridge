@@ -16,10 +16,11 @@ public interface IPrinterSpooler
 /// </summary>
 public interface IDriverPrinter
 {
-    bool PrintDocumentViaDriver(string printerPath, string docName, string filePath, string format, PrintSettings settings);
+    DriverPrintResult PrintDocumentViaDriver(string printerPath, string docName, string filePath, string format, PrintSettings settings);
 }
 
 public record SpoolResult(bool Success, string? SpoolJobId, string? Message);
+public record DriverPrintResult(bool Success, bool PhysicalPrintConfirmed, string Message);
 
 /// <summary>
 /// Diagnostic in-memory mock spooler for automated tests, CI, and dry-run testing.
@@ -38,10 +39,10 @@ public class MockSpooler : IPrinterSpooler, IDriverPrinter
         return new SpoolResult(true, $"mock-spool-{Guid.NewGuid()}", $"Mock spooler accepted {rawPayload.Length} bytes for {printerPath}");
     }
 
-    public bool PrintDocumentViaDriver(string printerPath, string docName, string filePath, string format, PrintSettings settings)
+    public DriverPrintResult PrintDocumentViaDriver(string printerPath, string docName, string filePath, string format, PrintSettings settings)
     {
         DriverJobs.Add((printerPath, docName, format, settings));
-        return true;
+        return new DriverPrintResult(true, false, $"Mock driver accepted {docName} for {printerPath}");
     }
 }
 
@@ -51,18 +52,25 @@ public class MockSpooler : IPrinterSpooler, IDriverPrinter
 /// </summary>
 public class WindowsDriverPrinter : IDriverPrinter
 {
-    public bool PrintDocumentViaDriver(string printerPath, string docName, string filePath, string format, PrintSettings settings)
+    private static readonly HashSet<string> KnownPrinttoFormats = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "pdf", "txt", "doc", "docx", "rtf", "xls", "xlsx", "ppt", "pptx", "jpg", "jpeg", "png", "bmp", "tif", "tiff"
+    };
+
+    public DriverPrintResult PrintDocumentViaDriver(string printerPath, string docName, string filePath, string format, PrintSettings settings)
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            Console.WriteLine("[DRIVER_PRINT] Windows driver printing is only supported on Windows OS.");
-            return false;
+            return new DriverPrintResult(false, false, "Windows driver printing is only supported on Windows OS.");
+        }
+
+        if (!KnownPrinttoFormats.Contains(format))
+        {
+            return new DriverPrintResult(false, false, $"No registered printto handler found for format '{format}'.");
         }
 
         try
         {
-            // Invoke the installed Windows application or shell print-to verb with the target printer name
-            // Uses ShellExecute printto: "PrintTo <PrinterName>"
             var psi = new ProcessStartInfo
             {
                 FileName = filePath,
@@ -80,18 +88,24 @@ public class WindowsDriverPrinter : IDriverPrinter
                 if (!proc.WaitForExit(30000))
                 {
                     try { proc.Kill(); } catch { }
-                    Console.WriteLine($"[DRIVER_PRINT] Timed out waiting for Windows print process for {docName}.");
-                    return false;
+                    return new DriverPrintResult(false, false, $"Timed out (30s) waiting for Windows print process for {docName}.");
                 }
-                return proc.ExitCode == 0;
+
+                if (proc.ExitCode == 0)
+                {
+                    // ACCURATE STATUS REPORTING:
+                    // Process exiting with code 0 confirms acceptance by Windows spooler subsystem,
+                    // NOT confirmed physical paper discharge from printer hardware.
+                    return new DriverPrintResult(true, false, $"Driver accepted document {docName} into spooler for printer {printerPath}. Physical printing pending in spooler.");
+                }
+                return new DriverPrintResult(false, false, $"Windows driver process exited with error code {proc.ExitCode}.");
             }
 
-            return false;
+            return new DriverPrintResult(false, false, $"Failed to launch driver print process for {docName}.");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[DRIVER_PRINT] Windows driver execution exception: {ex.Message}");
-            return false;
+            return new DriverPrintResult(false, false, $"Windows driver execution exception: {ex.Message}");
         }
     }
 }

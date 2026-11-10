@@ -40,6 +40,8 @@ CREATE TABLE IF NOT EXISTS print_jobs (
     tenant_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
     user_email TEXT NOT NULL,
+    employee_name TEXT,
+    receipt_token TEXT,
     printer_id TEXT NOT NULL,
     printer_name TEXT NOT NULL,
     original_filename TEXT NOT NULL,
@@ -60,6 +62,12 @@ CREATE TABLE IF NOT EXISTS print_jobs (
     FOREIGN KEY(printer_id) REFERENCES printers(id)
 );
 
+CREATE TABLE IF NOT EXISTS system_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_logs (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL,
@@ -70,7 +78,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     created_at INTEGER NOT NULL
 );
 
--- Seed default office tenant and HP LaserJet M1136
+-- Seed default office tenant, printer, and system settings
 INSERT OR IGNORE INTO tenants (id, name, created_at)
 VALUES ('dtc-office', 'DTC Main Office', 1715000000);
 
@@ -82,14 +90,20 @@ INSERT OR IGNORE INTO printers (
     'hp-laserjet-m1136',
     'dtc-office',
     'HP LaserJet Professional M1136 MFP',
-    'SILVERTOUCH-PC',
+    'OFFICE-HOST',
     'HP LaserJet Professional M1136 MFP',
-    '\\SILVERTOUCH-PC\HP LaserJet Professional M1136 MFP',
+    '\\\\OFFICE-HOST\\HP LaserJet Professional M1136 MFP',
     1,
     0,
     0,
     1,
     99,
-    'HP LaserJet M1136 monochrome MFP shared via SILVERTOUCH-PC',
+    'Shared monochrome office laser printer',
     1715000000
 );
+
+INSERT OR IGNORE INTO system_settings (key, value, updated_at)
+VALUES ('queue_paused', 'false', 1715000000);
+
+INSERT OR IGNORE INTO system_settings (key, value, updated_at)
+VALUES ('max_copies_limit', '50', 1715000000);

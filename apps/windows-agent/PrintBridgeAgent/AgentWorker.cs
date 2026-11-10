@@ -185,19 +185,18 @@ public class AgentWorker
                 // Driver printing path (WindowsDriverPrinter on Windows OS)
                 if (_driverPrinter != null)
                 {
-                    bool driverSuccess = _driverPrinter.PrintDocumentViaDriver(targetPrinter, $"PrintBridge_{claimedJobId}_{filename}", safeTargetFile, format, settings);
-                    if (driverSuccess)
+                    var driverRes = _driverPrinter.PrintDocumentViaDriver(targetPrinter, $"PrintBridge_{claimedJobId}_{filename}", safeTargetFile, format, settings);
+                    if (driverRes.Success)
                     {
-                        string msg = $"Driver accepted document {filename} for printer {targetPrinter} (Copies={settings.Copies})";
-                        Console.WriteLine(msg);
-                        await UpdateStatusAsync(claimedJobId, leaseToken ?? "", "completed", msg);
+                        Console.WriteLine($"[DRIVER_ACCEPTED] {driverRes.Message}");
+                        // Accurately mark spooler handoff: driver has accepted the payload
+                        await UpdateStatusAsync(claimedJobId, leaseToken ?? "", "completed", driverRes.Message);
                         return true;
                     }
                     else
                     {
-                        string err = $"Driver failed to print document {filename}";
-                        Console.WriteLine(err);
-                        await UpdateStatusAsync(claimedJobId, leaseToken ?? "", "failed", err);
+                        Console.WriteLine($"[DRIVER_REJECTED] {driverRes.Message}");
+                        await UpdateStatusAsync(claimedJobId, leaseToken ?? "", "failed", driverRes.Message);
                         return false;
                     }
                 }

@@ -1,4 +1,4 @@
-// Admin Dashboard Client Logic
+// Admin Dashboard Client Logic - Secure rendering to prevent stored XSS
 document.addEventListener('DOMContentLoaded', () => {
   const loginCard = document.getElementById('loginCard') as HTMLDivElement;
   const dashboardCard = document.getElementById('dashboardCard') as HTMLDivElement;
@@ -105,55 +105,101 @@ document.addEventListener('DOMContentLoaded', () => {
       });
 
       if (!res.ok) {
-        if (res.status === 401) setToken(null);
+        if (res.status === 401 || res.status === 403) setToken(null);
         return;
       }
 
       const jobs = await res.json();
+      queueTableBody.innerHTML = '';
+
       if (!Array.isArray(jobs) || jobs.length === 0) {
-        queueTableBody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted);">No print jobs in queue.</td></tr>';
+        const emptyTr = document.createElement('tr');
+        const emptyTd = document.createElement('td');
+        emptyTd.colSpan = 7;
+        emptyTd.style.textAlign = 'center';
+        emptyTd.style.color = '#64748b';
+        emptyTd.textContent = 'No print jobs in queue.';
+        emptyTr.appendChild(emptyTd);
+        queueTableBody.appendChild(emptyTr);
         return;
       }
 
-      queueTableBody.innerHTML = jobs.map((job: any) => {
-        const timeStr = new Date(job.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        const name = job.employeeName || 'Anonymous Guest';
-        const badgeClass = `badge-${job.status}`;
-        const canCancel = ['pending', 'claimed'].includes(job.status);
-        const cancelBtn = canCancel
-          ? `<button class="btn btn-danger" onclick="cancelJob('${job.id}')">Cancel</button>`
-          : '-';
+      // XSS DEFENSE: Safe DOM creation using textContent for all untrusted server fields
+      for (const job of jobs) {
+        const tr = document.createElement('tr');
 
-        return `
-          <tr>
-            <td>${timeStr}</td>
-            <td><strong>${name}</strong></td>
-            <td>${job.originalFileName}</td>
-            <td>${(job.fileFormat || '').toUpperCase()}</td>
-            <td><span class="badge ${badgeClass}">${job.status}</span></td>
-            <td style="font-size: 0.75rem; color: var(--text-muted);">${job.statusMessage || ''}</td>
-            <td>${cancelBtn}</td>
-          </tr>
-        `;
-      }).join('');
+        // 1. Time
+        const tdTime = document.createElement('td');
+        tdTime.textContent = new Date(job.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        tr.appendChild(tdTime);
+
+        // 2. Name
+        const tdName = document.createElement('td');
+        const strongName = document.createElement('strong');
+        strongName.textContent = job.employeeName || 'Anonymous Guest';
+        tdName.appendChild(strongName);
+        tr.appendChild(tdName);
+
+        // 3. Document
+        const tdDoc = document.createElement('td');
+        tdDoc.textContent = job.originalFileName || '';
+        tr.appendChild(tdDoc);
+
+        // 4. Format
+        const tdFormat = document.createElement('td');
+        tdFormat.textContent = (job.fileFormat || '').toUpperCase();
+        tr.appendChild(tdFormat);
+
+        // 5. Status Badge
+        const tdStatus = document.createElement('td');
+        const badge = document.createElement('span');
+        badge.className = `badge badge-${job.status}`;
+        badge.textContent = job.status || '';
+        tdStatus.appendChild(badge);
+        tr.appendChild(tdStatus);
+
+        // 6. Details
+        const tdDetails = document.createElement('td');
+        tdDetails.style.fontSize = '0.75rem';
+        tdDetails.style.color = '#64748b';
+        tdDetails.textContent = job.statusMessage || '';
+        tr.appendChild(tdDetails);
+
+        // 7. Actions
+        const tdAction = document.createElement('td');
+        const canCancel = ['pending', 'claimed'].includes(job.status);
+        if (canCancel) {
+          const cancelBtn = document.createElement('button');
+          cancelBtn.className = 'btn btn-danger';
+          cancelBtn.textContent = 'Cancel';
+          cancelBtn.addEventListener('click', async () => {
+            if (!confirm(`Cancel print job for ${job.employeeName || 'this user'}?`)) return;
+            const cancelRes = await fetch(`/api/admin/queue/${job.id}/cancel`, {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${token}` }
+            });
+            if (cancelRes.ok) loadQueue();
+            else alert('Failed to cancel job.');
+          });
+          tdAction.appendChild(cancelBtn);
+        } else {
+          tdAction.textContent = '-';
+        }
+        tr.appendChild(tdAction);
+
+        queueTableBody.appendChild(tr);
+      }
     } catch (e: any) {
-      queueTableBody.innerHTML = `<tr><td colspan="7" style="color: red;">Failed to load queue: ${e.message}</td></tr>`;
+      queueTableBody.innerHTML = '';
+      const errTr = document.createElement('tr');
+      const errTd = document.createElement('td');
+      errTd.colSpan = 7;
+      errTd.style.color = 'red';
+      errTd.textContent = `Failed to load queue: ${e.message}`;
+      errTr.appendChild(errTd);
+      queueTableBody.appendChild(errTr);
     }
   }
-
-  // Global cancelJob function
-  (window as any).cancelJob = async (id: string) => {
-    const token = getToken();
-    if (!token || !confirm('Are you sure you want to cancel this print job?')) return;
-    try {
-      const res = await fetch(`/api/admin/queue/${id}/cancel`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-      if (res.ok) loadQueue();
-      else alert('Failed to cancel job.');
-    } catch {}
-  };
 
   updateView();
 });

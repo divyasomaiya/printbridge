@@ -139,13 +139,36 @@ export class PrintBridgeApi {
     this.printers.set(MOCK_PRINTER_CAPABILITY.id, MOCK_PRINTER_CAPABILITY);
   }
 
-  getQueueSettings(): { queuePaused: boolean; maxCopiesLimit: number } {
+  async getQueueSettings(): Promise<{ queuePaused: boolean; maxCopiesLimit: number }> {
+    if (this.db) {
+      try {
+        const pausedRow = await this.db.prepare('SELECT value FROM system_settings WHERE key = "queue_paused"').first();
+        const copiesRow = await this.db.prepare('SELECT value FROM system_settings WHERE key = "max_copies_limit"').first();
+        const isPaused = pausedRow ? pausedRow.value === 'true' : this.queuePaused;
+        const maxCopies = copiesRow ? parseInt(copiesRow.value, 10) : this.maxCopiesLimit;
+        return { queuePaused: isPaused, maxCopiesLimit: isNaN(maxCopies) ? 50 : maxCopies };
+      } catch {
+        return { queuePaused: this.queuePaused, maxCopiesLimit: this.maxCopiesLimit };
+      }
+    }
     return { queuePaused: this.queuePaused, maxCopiesLimit: this.maxCopiesLimit };
   }
 
-  setQueueSettings(settings: { queuePaused?: boolean; maxCopiesLimit?: number }): void {
-    if (typeof settings.queuePaused === 'boolean') this.queuePaused = settings.queuePaused;
-    if (typeof settings.maxCopiesLimit === 'number') this.maxCopiesLimit = settings.maxCopiesLimit;
+  async setQueueSettings(settings: { queuePaused?: boolean; maxCopiesLimit?: number }): Promise<void> {
+    if (typeof settings.queuePaused === 'boolean') {
+      this.queuePaused = settings.queuePaused;
+      if (this.db) {
+        await this.db.prepare('INSERT INTO system_settings (key, value, updated_at) VALUES ("queue_paused", ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at')
+          .bind(settings.queuePaused ? 'true' : 'false', Date.now()).run();
+      }
+    }
+    if (typeof settings.maxCopiesLimit === 'number') {
+      this.maxCopiesLimit = settings.maxCopiesLimit;
+      if (this.db) {
+        await this.db.prepare('INSERT INTO system_settings (key, value, updated_at) VALUES ("max_copies_limit", ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at')
+          .bind(settings.maxCopiesLimit.toString(), Date.now()).run();
+      }
+    }
   }
 
   /**
@@ -361,12 +384,13 @@ export class PrintBridgeApi {
     fileBytes: Uint8Array;
     settings: PrintSettings;
   }): Promise<{ success: boolean; job?: PrintJob; receiptToken?: string; error?: string }> {
-    if (this.queuePaused) {
+    const queueSettings = await this.getQueueSettings();
+    if (queueSettings.queuePaused) {
       return { success: false, error: 'Print queue is currently paused by the administrator.' };
     }
 
-    if (params.settings.copies > this.maxCopiesLimit) {
-      return { success: false, error: `Requested copies (${params.settings.copies}) exceeds administrator limit (${this.maxCopiesLimit}).` };
+    if (params.settings.copies > queueSettings.maxCopiesLimit) {
+      return { success: false, error: `Requested copies (${params.settings.copies}) exceeds administrator limit (${queueSettings.maxCopiesLimit}).` };
     }
 
     const printer = this.printers.get(params.printerId);
@@ -419,16 +443,16 @@ export class PrintBridgeApi {
     if (this.db) {
       await this.db.prepare(`
         INSERT INTO print_jobs (
-          id, tenant_id, user_id, user_email, employee_name, printer_id, printer_name,
+          id, tenant_id, user_id, user_email, employee_name, receipt_token, printer_id, printer_name,
           original_filename, file_size_bytes, file_format, mime_type,
           r2_storage_key, settings_json, status, status_message, lease_token, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).bind(
-        newJob.id, newJob.tenantId, newJob.userId, newJob.userEmail, displayName,
+        newJob.id, newJob.tenantId, newJob.userId, newJob.userEmail, displayName, receiptToken,
         newJob.printerId, newJob.printerName, newJob.originalFileName,
         newJob.fileSizeBytes, newJob.fileFormat, newJob.mimeType,
         newJob.r2StorageKey, JSON.stringify(newJob.settings),
-        newJob.status, newJob.statusMessage, receiptToken, newJob.createdAt, newJob.updatedAt
+        newJob.status, newJob.statusMessage, null, newJob.createdAt, newJob.updatedAt
       ).run();
     } else {
       this.jobs.set(jobId, newJob);
@@ -449,8 +473,8 @@ export class PrintBridgeApi {
       const row = await this.db.prepare(query).bind(...params).first();
       if (!row) return undefined;
 
-      // If receipt token is provided for guest tracking, verify match
-      if (receiptToken && row.lease_token !== receiptToken) {
+      // If receipt token is provided for guest tracking, verify match against receipt_token column
+      if (receiptToken && row.receipt_token !== receiptToken) {
         return undefined;
       }
 
@@ -492,6 +516,12 @@ export class PrintBridgeApi {
 
   async claimJob(req: ClaimJobRequest, agentAuthToken?: string | null): Promise<ClaimJobResponse> {
     this.assertAgentAuthenticated(agentAuthToken);
+
+    const settings = await this.getQueueSettings();
+    if (settings.queuePaused) {
+      console.log('claimJob rejected: print queue is paused by administrator.');
+      return { job: null };
+    }
 
     const now = Date.now();
     const leaseDuration = (req.leaseDurationSeconds || LEASE_DURATION_SECONDS) * 1000;
@@ -866,11 +896,14 @@ export default {
         });
       }
 
-      // Administrative Queue Management endpoints (Protected)
+      // Administrative Queue Management endpoints (Protected strictly with Admin Role check)
       if (url.pathname === '/api/admin/queue' && request.method === 'GET') {
         let authContext: AuthContext;
         try {
           authContext = await api.authenticateEmployee(request.headers);
+          if (!authContext.isAdmin) {
+            return new Response(JSON.stringify({ error: 'Forbidden: Administrator privileges required.' }), { status: 403, headers });
+          }
         } catch (authErr: any) {
           return new Response(JSON.stringify({ error: authErr.message }), { status: 401, headers });
         }
@@ -880,7 +913,10 @@ export default {
 
       if (url.pathname.startsWith('/api/admin/queue/') && url.pathname.endsWith('/cancel') && request.method === 'POST') {
         try {
-          await api.authenticateEmployee(request.headers);
+          const authContext = await api.authenticateEmployee(request.headers);
+          if (!authContext.isAdmin) {
+            return new Response(JSON.stringify({ error: 'Forbidden: Administrator privileges required.' }), { status: 403, headers });
+          }
         } catch (authErr: any) {
           return new Response(JSON.stringify({ error: authErr.message }), { status: 401, headers });
         }
@@ -891,22 +927,30 @@ export default {
 
       if (url.pathname === '/api/admin/settings' && request.method === 'GET') {
         try {
-          await api.authenticateEmployee(request.headers);
+          const authContext = await api.authenticateEmployee(request.headers);
+          if (!authContext.isAdmin) {
+            return new Response(JSON.stringify({ error: 'Forbidden: Administrator privileges required.' }), { status: 403, headers });
+          }
         } catch (authErr: any) {
           return new Response(JSON.stringify({ error: authErr.message }), { status: 401, headers });
         }
-        return new Response(JSON.stringify(api.getQueueSettings()), { headers });
+        const settings = await api.getQueueSettings();
+        return new Response(JSON.stringify(settings), { headers });
       }
 
       if (url.pathname === '/api/admin/settings' && request.method === 'POST') {
         try {
-          await api.authenticateEmployee(request.headers);
+          const authContext = await api.authenticateEmployee(request.headers);
+          if (!authContext.isAdmin) {
+            return new Response(JSON.stringify({ error: 'Forbidden: Administrator privileges required.' }), { status: 403, headers });
+          }
         } catch (authErr: any) {
           return new Response(JSON.stringify({ error: authErr.message }), { status: 401, headers });
         }
         const body: any = await request.json();
-        api.setQueueSettings(body);
-        return new Response(JSON.stringify({ success: true, settings: api.getQueueSettings() }), { headers });
+        await api.setQueueSettings(body);
+        const settings = await api.getQueueSettings();
+        return new Response(JSON.stringify({ success: true, settings }), { headers });
       }
 
       // Query job status:
