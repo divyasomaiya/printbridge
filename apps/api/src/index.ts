@@ -175,7 +175,10 @@ export class PrintBridgeApi {
    * Generates a signed, short-lived session token (valid for 8 hours).
    */
   async createSessionToken(userId: string, email: string, isAdmin = false): Promise<string> {
-    const signingKey = this.employeeAuthSecret || this.adminPassword || 'printbridge-fallback-secret';
+    const signingKey = this.adminPassword || this.employeeAuthSecret;
+    if (!signingKey) {
+      throw new Error('Server authentication configuration missing: ADMIN_PASSWORD or EMPLOYEE_AUTH_SECRET must be configured.');
+    }
     const expiry = Date.now() + 8 * 3600 * 1000;
     const payload = `${userId}:${email}:${expiry}:${this.defaultTenantId}:${isAdmin ? 'admin' : 'emp'}`;
     const sig = await signHmacSha256(signingKey, payload);
@@ -187,7 +190,10 @@ export class PrintBridgeApi {
    * Verifies short-lived session token.
    */
   async verifySessionToken(token: string): Promise<AuthContext> {
-    const signingKey = this.employeeAuthSecret || this.adminPassword || 'printbridge-fallback-secret';
+    const signingKey = this.adminPassword || this.employeeAuthSecret;
+    if (!signingKey) {
+      throw new Error('Server authentication configuration missing: ADMIN_PASSWORD or EMPLOYEE_AUTH_SECRET must be configured.');
+    }
     const parts = token.split('.');
     if (parts.length !== 3 || parts[0] !== 'sess') {
       throw new Error('Invalid session token format.');

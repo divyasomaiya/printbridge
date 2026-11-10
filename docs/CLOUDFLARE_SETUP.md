@@ -90,20 +90,32 @@ npx wrangler secret put ADMIN_PASSWORD
 ## 6. Two Separate Interfaces
 
 1. **Public/Guest Printing (`/`)**:
-   - For employees, clients, and guests.
+   - For employees, clients, and office guests.
    - Flow: **Open Website → Enter Name → Select Document → Choose Print Settings → Print**.
    - No login, registration, or password required.
-   - Status tracking is secured via unguessable receipt tokens.
+   - Status tracking is secured via unguessable `receipt_token` parameters.
 2. **Private Administrator Dashboard (`/admin`)**:
    - For the owner/staff.
    - Login username: `admin123`.
    - Live queue table with guest names, timestamps, printer status, pause/resume queue button, and job cancellation.
+   - Protected with strictly enforced `isAdmin: true` authorization and stored XSS defense.
 
 ---
 
-## 7. Applying Database Migrations
+## 7. Database Tables and Migrations
 
-From the `apps/api` directory:
+The database migration is located at `apps/api/migrations/0001_init.sql` and establishes:
+- `tenants`: Multi-tenant organization boundaries.
+- `printers`: Printer hardware capabilities and network paths.
+- `print_jobs`: Print queue table containing:
+  - `receipt_token`: Unguessable guest tracking token (separate from agent `lease_token`).
+  - `employee_name`: Guest or employee name for physical printout identification.
+  - `lease_token`: Hashed claim token for Windows agent execution.
+- `system_settings`: Key-value store persisting:
+  - `queue_paused`: Flag (`true`/`false`) pausing or resuming queue processing.
+  - `max_copies_limit`: Configurable upper bound on requested copies per job.
+
+Execute migrations from `apps/api`:
 
 ```bash
 # Local testing migration:

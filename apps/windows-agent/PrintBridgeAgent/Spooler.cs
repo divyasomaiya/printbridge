@@ -47,12 +47,21 @@ public class MockSpooler : IPrinterSpooler, IDriverPrinter
 }
 
 /// <summary>
-/// Standard Windows driver-level printing using Windows shell print-to verb or process pipeline.
-/// Leverages the installed Windows printer driver on the Windows 10 gateway without implementing custom drivers.
+/// Windows driver-level printing bridge using Windows shell print-to verb.
+///
+/// HARDWARE-UNTESTED NOTICE:
+/// 1. Windows shell 'printto' execution delegates to whatever default application is registered
+///    for that file extension on the local Windows gateway (e.g. Acrobat Reader, Word, Excel, Photo Viewer).
+/// 2. If the gateway machine does not have an associated printto handler for a given extension,
+///    Process.Start will throw Win32Exception (No application associated).
+/// 3. Standard 'printto' does NOT programmatically guarantee custom print settings (e.g. custom page ranges,
+///    n-up, scaling) are accepted by third-party viewer applications without dedicated COM/CLI automation.
+/// 4. A successful process exit code (0) only confirms that the associated application closed without error.
+///    It DOES NOT confirm that the HP LaserJet M1136 physically drew paper or completed the print cycle.
 /// </summary>
 public class WindowsDriverPrinter : IDriverPrinter
 {
-    private static readonly HashSet<string> KnownPrinttoFormats = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly HashSet<string> CandidatePrinttoFormats = new(StringComparer.OrdinalIgnoreCase)
     {
         "pdf", "txt", "doc", "docx", "rtf", "xls", "xlsx", "ppt", "pptx", "jpg", "jpeg", "png", "bmp", "tif", "tiff"
     };
@@ -64,9 +73,9 @@ public class WindowsDriverPrinter : IDriverPrinter
             return new DriverPrintResult(false, false, "Windows driver printing is only supported on Windows OS.");
         }
 
-        if (!KnownPrinttoFormats.Contains(format))
+        if (!CandidatePrinttoFormats.Contains(format))
         {
-            return new DriverPrintResult(false, false, $"No registered printto handler found for format '{format}'.");
+            return new DriverPrintResult(false, false, $"Unsupported format '{format}'. No candidate driver printto handler recognized.");
         }
 
         try
@@ -88,20 +97,24 @@ public class WindowsDriverPrinter : IDriverPrinter
                 if (!proc.WaitForExit(30000))
                 {
                     try { proc.Kill(); } catch { }
-                    return new DriverPrintResult(false, false, $"Timed out (30s) waiting for Windows print process for {docName}.");
+                    return new DriverPrintResult(false, false, $"Timed out (30s) waiting for Windows driver print process for {docName}.");
                 }
 
                 if (proc.ExitCode == 0)
                 {
                     // ACCURATE STATUS REPORTING:
-                    // Process exiting with code 0 confirms acceptance by Windows spooler subsystem,
+                    // Process exiting with code 0 confirms acceptance by associated application / driver,
                     // NOT confirmed physical paper discharge from printer hardware.
-                    return new DriverPrintResult(true, false, $"Driver accepted document {docName} into spooler for printer {printerPath}. Physical printing pending in spooler.");
+                    return new DriverPrintResult(true, false, $"Driver handoff complete for {docName} on {printerPath}. Physical printing pending in Windows spooler.");
                 }
-                return new DriverPrintResult(false, false, $"Windows driver process exited with error code {proc.ExitCode}.");
+                return new DriverPrintResult(false, false, $"Windows driver process exited with non-zero code {proc.ExitCode}.");
             }
 
             return new DriverPrintResult(false, false, $"Failed to launch driver print process for {docName}.");
+        }
+        catch (System.ComponentModel.Win32Exception w32Ex)
+        {
+            return new DriverPrintResult(false, false, $"Driver printto association error for '{format}': {w32Ex.Message}. Gateway requires an installed viewer application for this format.");
         }
         catch (Exception ex)
         {
