@@ -1,17 +1,11 @@
+-- Print Bridge Database Schema for Cloudflare D1 (SQLite)
 
--- PrintBridge by DTC
--- Initial Cloudflare D1 schema
--- Office: SILVERTOUCH-PC
--- Safety: print queue starts paused
-
--- 1. Office tenants
 CREATE TABLE IF NOT EXISTS tenants (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     created_at INTEGER NOT NULL
 );
 
--- 2. Windows gateway agents
 CREATE TABLE IF NOT EXISTS agents (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL,
@@ -21,10 +15,9 @@ CREATE TABLE IF NOT EXISTS agents (
     is_active INTEGER NOT NULL DEFAULT 1,
     last_seen_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
-    FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+    FOREIGN KEY(tenant_id) REFERENCES tenants(id)
 );
 
--- 3. Available printers
 CREATE TABLE IF NOT EXISTS printers (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL,
@@ -39,10 +32,9 @@ CREATE TABLE IF NOT EXISTS printers (
     max_copies INTEGER NOT NULL DEFAULT 99,
     description TEXT,
     updated_at INTEGER NOT NULL,
-    FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+    FOREIGN KEY(tenant_id) REFERENCES tenants(id)
 );
 
--- 4. Document printing jobs
 CREATE TABLE IF NOT EXISTS print_jobs (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL,
@@ -66,18 +58,16 @@ CREATE TABLE IF NOT EXISTS print_jobs (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     completed_at INTEGER,
-    FOREIGN KEY (tenant_id) REFERENCES tenants(id),
-    FOREIGN KEY (printer_id) REFERENCES printers(id)
+    FOREIGN KEY(tenant_id) REFERENCES tenants(id),
+    FOREIGN KEY(printer_id) REFERENCES printers(id)
 );
 
--- 5. System configuration
 CREATE TABLE IF NOT EXISTS system_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 );
 
--- 6. Activity and audit records
 CREATE TABLE IF NOT EXISTS audit_logs (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL,
@@ -88,60 +78,32 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     created_at INTEGER NOT NULL
 );
 
--- Initial office tenant
-INSERT OR IGNORE INTO tenants (
-    id, name, created_at
-) VALUES (
-    'dtc-office',
-    'DTC Main Office',
-    1715000000
-);
+-- Seed default office tenant, printer, and system settings
+INSERT OR IGNORE INTO tenants (id, name, created_at)
+VALUES ('dtc-office', 'DTC Main Office', 1715000000);
 
--- Real network printer verified from PC4
 INSERT OR IGNORE INTO printers (
-    id,
-    tenant_id,
-    name,
-    host,
-    share_name,
-    full_unc_path,
-    is_online,
-    supports_color,
-    supports_auto_duplex,
-    supports_manual_duplex,
-    max_copies,
-    description,
-    updated_at
+    id, tenant_id, name, host, share_name, full_unc_path,
+    is_online, supports_color, supports_auto_duplex, supports_manual_duplex,
+    max_copies, description, updated_at
 ) VALUES (
     'hp-laserjet-m1136',
     'dtc-office',
     'HP LaserJet Professional M1136 MFP',
     'SILVERTOUCH-PC',
     'HP LaserJet Professional M1136 MFP',
-    '\\SILVERTOUCH-PC\HP LaserJet Professional M1136 MFP',
+    '\\\\SILVERTOUCH-PC\\HP LaserJet Professional M1136 MFP',
     1,
     0,
     0,
     1,
     99,
-    'Shared monochrome HP office printer',
+    'Shared monochrome office laser printer on SILVERTOUCH-PC',
     1715000000
 );
 
--- Safety: automatic printing disabled initially
-INSERT OR IGNORE INTO system_settings (
-    key, value, updated_at
-) VALUES (
-    'queue_paused',
-    'true',
-    1715000000
-);
+INSERT OR IGNORE INTO system_settings (key, value, updated_at)
+VALUES ('queue_paused', 'true', 1715000000);
 
--- Maximum number of copies per job
-INSERT OR IGNORE INTO system_settings (
-    key, value, updated_at
-) VALUES (
-    'max_copies_limit',
-    '50',
-    1715000000
-);
+INSERT OR IGNORE INTO system_settings (key, value, updated_at)
+VALUES ('max_copies_limit', '50', 1715000000);

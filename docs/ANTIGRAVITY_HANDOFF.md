@@ -4,73 +4,69 @@ Universal Cloud-to-Local-Printer Architecture & Continuation Guide for Google An
 
 ---
 
-## 1. Executive Summary & Verification Context
+## 1. Verified Environment & Hardware Reality
 
-Print Bridge is a secure, lightweight, unattended cloud-to-printer platform designed to enable authorized users and office guests to print documents directly from phones, tablets, and laptops to office printers without emailing files between computers.
+### Production Infrastructure:
+- **Cloudflare Plan**: Free
+- **Worker Name**: `print-bridge-api`
+- **D1 Database**: `print-bridge-d1` (ID: `3aa0a5f9-6087-46ea-ba88-e57727f6073b`)
+- **D1 Tables (6)**: `tenants`, `agents`, `printers`, `print_jobs`, `system_settings`, `audit_logs`
+- **R2 Bucket**: `print-bridge-documents` (private access, 1-day lifecycle rule `delete-temp-documents`)
+- **Initial System Settings**: `queue_paused=true`, `max_copies_limit=50`
 
-### Current Deployment Environment:
-- **Print Host**: Windows 7 SP1 host machine with shared HP LaserJet Professional M1136 MFP on the local LAN (`\\<OFFICE-HOST>\<PRINTER-SHARE-NAME>`).
-- **Company Data Safeguard**: The print host contains ~5 TB of historical company data.
-  - **CRITICAL DIRECTIVE**: Under NO circumstances should anything be installed, configured, or modified on the host machine.
-- **Gateway**: Windows 10 gateway machine (12 GB RAM) with network printing access to the shared printer. The Print Bridge Windows Agent executes on this gateway.
-
----
-
-## 2. Implemented Architecture Through Commit `750f5ae`
-
-1. **Dual Web Interfaces**:
-   - **Public Guest Printing (`/`)**: Frictionless flow: **Open Website → Enter Name → Select Document → Choose Print Settings → Print**. No login or registration required. Jobs are tracked using unguessable random `receipt_token` values.
-   - **Private Administrator Dashboard (`/admin`)**: Protected login for username `admin123`. Enforces `isAdmin: true` authorization on all `/api/admin/*` endpoints (returning 403 Forbidden for non-admins). Table cells use safe DOM `textContent` rendering, eliminating stored XSS risks.
-2. **D1 Persistence & Token Segregation**:
-   - `0001_init.sql` schema includes `employee_name TEXT`, `receipt_token TEXT`, and `system_settings` table.
-   - Segregates guest tracking (`receipt_token`) from agent leasing (`lease_token`), ensuring guest status polling remains active after an agent claims a job.
-   - Persists queue settings (`queue_paused`, `max_copies_limit`) into D1; agent `claimJob()` rejects claims while the queue is paused.
-3. **Hardened Production Authentication**:
-   - Eliminated all hardcoded signing secrets. Session token creation and validation strictly fail closed if `ADMIN_PASSWORD` or `EMPLOYEE_AUTH_SECRET` are not set.
-4. **Windows Agent Driver Printing & Realistic Guardrails**:
-   - Implemented `WindowsDriverPrinter` using the Windows shell `printto` verb with 30s execution timeouts and format checks.
-   - **HARDWARE-UNTESTED NOTICE**: Process exit code 0 indicates acceptance by the local associated application or driver into the Windows spooler subsystem, **NOT** confirmed physical paper delivery from the HP LaserJet M1136. Furthermore, shell `printto` does not guarantee custom page ranges or scaling are respected without dedicated application COM automation.
-   - RAW spooling of unrendered documents (PDF, Word, Excel, PowerPoint, images, text) is blocked from physical queues to prevent paper wastage and printer errors.
-   - Dry-run mode (`--dry-run`) exclusively targets diagnostic mock queues and never completes production jobs.
-5. **FileSandbox.cs Safety**:
-   - Boundary checks enforce trailing path separators, preventing sibling-prefix directory traversal.
-   - Job IDs validated with strict regex (`^[a-zA-Z0-9_\-]+$`).
-   - Ancestor directory walk rejects NTFS Reparse Points (symlinks and directory junctions).
-   - `SecureCleanup` restricts deletion strictly to immediate job directories and protects sandbox root.
+### Windows Hardware & Safety Boundary:
+- **Gateway**: Windows 10 x64 (12 GB RAM). Diagnostics pass and UNC printer reachability returns `YES`.
+- **Printer Host**: `SILVERTOUCH-PC` running Windows 7 SP1 (2 GB RAM) with HP LaserJet Professional M1136 MFP.
+- **CRITICAL DIRECTIVE**: `SILVERTOUCH-PC` contains ~5 TB of historical company data. **NEVER** install software, run scripts, modify printer drivers, or perform testing on `SILVERTOUCH-PC`.
+- **HARDWARE REALITY**: Network printer reachability is confirmed, but **physical paper printing has NOT been tested**. Do not claim physical printing works until an in-person paper test is conducted.
 
 ---
 
-## 3. Accurate Implementation Status Breakdown
+## 2. Implemented Features & Architecture
 
-| Format Category | Extensions | Implementation Status | Functional Reality & Antigravity Next Steps |
-|---|---|---|---|
-| **Plain Text / CSV** | `.txt`, `.csv` | **Driver Dispatched** | `TextRenderer` paginates lines. Dispatched via `WindowsDriverPrinter` (`printto Notepad.exe /p`). |
-| **PDF** | `.pdf` | **Driver Dispatched / Hardware Untested** | Dispatched via `WindowsDriverPrinter` (`printto` default PDF reader). Requires an installed PDF reader on the Windows 10 gateway. Embedding `PDFium` directly into the agent is the recommended next task for self-contained, driver-accurate rendering. |
-| **Images** | `.jpg`, `.png`, `.bmp`, `.webp`, `.tif` | **Driver Dispatched / Hardware Untested** | Dispatched via `WindowsDriverPrinter` (Windows Photo Viewer `printto`). |
-| **Sanitized Webpages** | `.html`, `.htm` | **Functional Security Sanitizer** | `WebpageRenderer` strips `<script>` tags, inline handlers (`onerror`, `onload`), and exfiltration URLs. |
-| **Office Documents** | `.doc`, `.docx`, `.rtf`, `.xls`, `.xlsx`, `.ppt`, `.pptx` | **Driver Dispatched / Missing Engine Reporting** | Dispatched via `WindowsDriverPrinter` if Office / LibreOffice is associated. Otherwise reports association error. |
+```
+print-bridge/
+├── apps/
+│   ├── api/             # Cloudflare Workers (D1, R2, Static Assets, cron retention)
+│   ├── web/             # Guest UI (/) & Admin Dashboard (/admin)
+│   └── windows-agent/   # Portable C# .NET 8 Agent (FileSandbox, winspool, printto)
+├── packages/
+│   ├── shared/          # Types, HP LaserJet M1136 profile, validation, page range parser
+│   └── renderers/       # Modular document rendering adapters (Text, PDF, Images, HTML, Office)
+├── tests/               # Unit, integration, and E2E test suites
+└── docs/                # Setup & continuation documentation
+```
+
+### Key Capabilities Implemented:
+1. **Public Guest Printing (`/`)**:
+   - Frictionless workflow: Enter Name $\rightarrow$ Select Document $\rightarrow$ Select Settings $\rightarrow$ Print.
+   - Unguessable `receipt_token` parameters ensure guests can only view their own job status.
+2. **Private Administrator Dashboard (`/admin`)**:
+   - Authenticated login for username `admin123`.
+   - Live queue table with guest names, timestamps, printer status, pause/resume queue toggle, and cancellation.
+   - Safe DOM node assignment (`textContent`) protects against stored XSS.
+3. **D1 Persistence & Token Separation**:
+   - Guest tracking `receipt_token` is stored separately from agent `lease_token`. Claiming a job does not break guest status polling.
+   - Queue pause state is persisted in `system_settings`; `claimJob()` rejects claims while the queue is paused.
+4. **Windows Agent FileSandbox & Spooler Guard**:
+   - Trailing-separator directory boundary enforcement (prevents sibling-prefix bypass).
+   - Strict alphanumeric job ID validation (`^[a-zA-Z0-9_\-]+$`).
+   - Ancestor directory walk rejects NTFS Reparse Points (symlinks/junctions).
+   - Blocks raw spooling of unrendered documents (PDF, Word, Excel, PowerPoint, images, text) to the physical printer.
+   - Dry-run mode (`--dry-run`) exclusively targets diagnostic queues and never marks production jobs completed.
+5. **Driver Printing Audit**:
+   - `WindowsDriverPrinter` delegates to the Windows shell `printto` verb with 30s execution timeouts.
+   - **Caveat**: Successful process exit only confirms driver spooler acceptance, not physical paper discharge.
 
 ---
 
-## 4. Windows Compatibility & Build Status
-
-- **Agent Project Target**: `net8.0` (`PrintBridgeAgent.csproj`).
-  - **Windows 10 Gateway**: Fully supported and builds cleanly using modern .NET runtime.
-  - **Binary Size & Footprint**: ~180 KB standalone assembly (~45 MB RAM under execution).
-  - **Windows 7 SP1**: `net8.0` runtime does not officially support Windows 7 without specific extended security updates.
-  - **Antigravity Action Item**: Add `.NET Framework 4.0` / `4.6.2` dual-targeting (`<TargetFrameworks>net8.0;net462</TargetFrameworks>`) using MSBuild so that a single native binary can run on legacy Windows 7 SP1 systems without requiring modern .NET runtime installation.
-- **Windows Spooler APIs (`winspool.drv`)**:
-  - P/Invoke definitions for `OpenPrinter`, `StartDocPrinter`, `StartPagePrinter`, `WritePrinter`, `EndPagePrinter`, `EndDocPrinter`, and `ClosePrinter` are 100% compatible with both Windows 7 SP1 and Windows 10.
-
----
-
-## 5. Test Suite & Verification Results
+## 3. Test Suite Verification
 
 ```
 TypeScript / Node Test Suites:
   ✔ tests/shared/shared.test.js (7/7 tests passed)
   ✔ tests/renderers/renderers.test.js (5/5 tests passed)
-  ✔ tests/api/api.test.js (5/5 tests passed: Guest Workflow, Admin admin123 403 Enforcement, Queue Pause Persistence, D1-Backed Integration)
+  ✔ tests/api/api.test.js (5/5 tests passed: Guest Workflow, Admin 403 Enforcement, Queue Pause, D1-Backed Integration)
   ✔ tests/e2e/e2e.test.js (1/1 test passed)
   Total: 18 passed, 0 failed
 
@@ -88,14 +84,15 @@ TypeScript / Node Test Suites:
 
 ---
 
-## 6. Manual Setup & Next Steps for Google Antigravity
+## 4. Antigravity Continuation Plan: Top 3 Tasks
 
-See `docs/CLOUDFLARE_SETUP.md` for complete step-by-step instructions for manual Cloudflare resource creation (D1, R2, Access, Wrangler secrets).
-
-Next engineering tasks:
-1. **Integrate Native PDFium / Ghostscript rasterizer**:
-   - Provide a C# wrapper for `pdfium.dll` on the Windows 10 gateway to render PDF pages directly to Windows `PrintDocument` GDI Graphics context.
-2. **Dual-Target .NET Framework 4.0/4.6.2**:
-   - Update `PrintBridgeAgent.csproj` to cross-compile for legacy Windows 7 environments.
-3. **Deploy Headless LibreOffice Portable Bundle**:
-   - Optionally package portable LibreOffice on the Windows 10 gateway for Word, Excel, and PowerPoint rendering with macros disabled.
+1. **Deploy Production Worker & Apply D1 Migrations**:
+   - Set production secrets via `npx wrangler secret put GATEWAY_API_KEY` and `npx wrangler secret put ADMIN_PASSWORD`.
+   - Run `npx wrangler d1 execute print-bridge-d1 --remote --file=./migrations/0001_init.sql`.
+   - Deploy via `npx wrangler deploy`. Keep queue paused initially.
+2. **First Controlled Physical Print Test (Windows 10 Gateway)**:
+   - Run `PrintBridgeAgent.exe --diagnose` on the Windows 10 gateway machine.
+   - Submit a single test page from the web UI.
+   - Unpause the queue from `/admin` and conduct an attended physical paper verification at the HP LaserJet M1136.
+3. **Embed Native PDFium Rasterization**:
+   - Replace reliance on shell `printto` associations by bundling a lightweight `PDFium` wrapper in `PrintBridgeAgent` to render PDF pages directly to GDI device contexts with exact copy and page-range fidelity.

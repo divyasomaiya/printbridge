@@ -534,13 +534,16 @@ export class PrintBridgeApi {
     const leaseExpiresAt = now + leaseDuration;
 
     if (this.db) {
-      const printerPlaceholders = req.supportedPrinters.map(() => '?').join(',');
+      const printersList = req.supportedPrinters && req.supportedPrinters.length > 0
+        ? req.supportedPrinters
+        : ['hp-laserjet-m1136', 'mock-printer-test'];
+      const printerPlaceholders = printersList.map(() => '?').join(',');
       const candidate = await this.db.prepare(`
         SELECT id FROM print_jobs
         WHERE (status = 'pending' OR (status = 'claimed' AND lease_expires_at < ?))
         AND printer_id IN (${printerPlaceholders})
         ORDER BY created_at ASC LIMIT 1
-      `).bind(now, ...req.supportedPrinters).first();
+      `).bind(now, ...printersList).first();
 
       if (!candidate) {
         return { job: null };

@@ -4,130 +4,60 @@ A complete, beginner-friendly manual for configuring and operating Print Bridge 
 
 ---
 
-## 1. Cloudflare Dashboard Overview & Login
+## 1. Verified Production Environment
 
-1. Log in to the [Cloudflare Dashboard](https://dash.cloudflare.com/).
-2. Select your target account from the home dashboard.
-
----
-
-## 2. Creating the D1 Database (Metadata & Queue)
-
-1. Navigate to **Storage & Databases** > **D1 SQL Database** in the left sidebar.
-2. Click **Create database**.
-3. Set the database name:
-   ```
-   print-bridge-d1
-   ```
-4. Click **Create**.
-5. Once created, note the **Database ID** (a UUID like `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`).
+- **Cloudflare Workers Plan**: Free
+- **Worker Name**: `print-bridge-api`
+- **D1 Database**: `print-bridge-d1`
+- **D1 Database ID**: `3aa0a5f9-6087-46ea-ba88-e57727f6073b` (configured in `apps/api/wrangler.toml`)
+- **R2 Bucket**: `print-bridge-documents`
+- **R2 Public Dev URL**: Disabled (private access only)
+- **R2 Object Expiration**: 1 day (`delete-temp-documents`)
+- **Default System Settings**: `queue_paused=true`, `max_copies_limit=50`
 
 ---
 
-## 3. Creating the Private R2 Storage Bucket (Temporary Documents)
+## 2. Setting Production Secrets via Wrangler
 
-1. Navigate to **Storage & Databases** > **R2 Object Storage** in the left sidebar.
-2. Click **Create bucket**.
-3. Set the bucket name:
-   ```
-   print-bridge-documents
-   ```
-4. Leave bucket access as **Private** (do NOT enable Public Access or custom public domains; all access must flow through authenticated Worker endpoints).
-5. (Optional) In bucket settings, add an **Object Lifecycle Rule** to auto-expire objects after 1 day as an extra defense-in-depth safety net.
-
----
-
-## 4. Configuring `apps/api/wrangler.toml`
-
-Open `apps/api/wrangler.toml` on your deployment machine and configure:
-
-```toml
-name = "print-bridge-api"
-main = "src/index.ts"
-compatibility_date = "2024-05-01"
-
-[assets]
-directory = "../web/public"
-binding = "ASSETS"
-
-[vars]
-ENVIRONMENT = "production"
-DEFAULT_TENANT_ID = "dtc-office"
-CF_ACCESS_AUD = "<PASTE-YOUR-CLOUDFLARE-ACCESS-AUDIENCE-TAG-HERE>" # Optional: If using Cloudflare Access Zero Trust
-CF_ACCESS_TEAM_DOMAIN = "https://<your-team-name>.cloudflareaccess.com"
-
-[[d1_databases]]
-binding = "DB"
-database_name = "print-bridge-d1"
-database_id = "<PASTE-YOUR-D1-DATABASE-ID-HERE>"
-
-[[r2_buckets]]
-binding = "STORAGE"
-bucket_name = "print-bridge-documents"
-
-[triggers]
-crons = ["*/15 * * * *"] # Executes cleanup every 15 minutes
-```
-
----
-
-## 5. Setting Production Secrets via Wrangler
-
-Do **NOT** put secrets in git repositories. Run these commands from your local terminal in `apps/api`:
+Secrets must **never** be placed in the git repository. Set them using Wrangler:
 
 ```bash
-# Set the gateway authentication key for the Windows Agent
-npx wrangler secret put GATEWAY_API_KEY
-# Enter a high-entropy secret (e.g., 32 random characters)
+cd apps/api
 
-# Set the private admin password for the /admin dashboard (username: admin123)
+# Gateway authentication key for Windows Agent polling
+npx wrangler secret put GATEWAY_API_KEY
+# Enter a high-entropy secret string
+
+# Administrator password for /admin dashboard (username: admin123)
 npx wrangler secret put ADMIN_PASSWORD
 # Enter your private administrator password
 ```
 
 ---
 
-## 6. Two Separate Interfaces
+## 3. Database Schema & Tables
 
-1. **Public/Guest Printing (`/`)**:
-   - For employees, clients, and office guests.
-   - Flow: **Open Website → Enter Name → Select Document → Choose Print Settings → Print**.
-   - No login, registration, or password required.
-   - Status tracking is secured via unguessable `receipt_token` parameters.
-2. **Private Administrator Dashboard (`/admin`)**:
-   - For the owner/staff.
-   - Login username: `admin123`.
-   - Live queue table with guest names, timestamps, printer status, pause/resume queue button, and job cancellation.
-   - Protected with strictly enforced `isAdmin: true` authorization and stored XSS defense.
-
----
-
-## 7. Database Tables and Migrations
-
-The database migration is located at `apps/api/migrations/0001_init.sql` and establishes:
+The SQLite database migration (`apps/api/migrations/0001_init.sql`) initializes:
 - `tenants`: Multi-tenant organization boundaries.
-- `printers`: Printer hardware capabilities and network paths.
-- `print_jobs`: Print queue table containing:
-  - `receipt_token`: Unguessable guest tracking token (separate from agent `lease_token`).
-  - `employee_name`: Guest or employee name for physical printout identification.
-  - `lease_token`: Hashed claim token for Windows agent execution.
-- `system_settings`: Key-value store persisting:
-  - `queue_paused`: Flag (`true`/`false`) pausing or resuming queue processing.
-  - `max_copies_limit`: Configurable upper bound on requested copies per job.
+- `printers`: Configured office printer capabilities (pointing to `\\SILVERTOUCH-PC\HP LaserJet Professional M1136 MFP`).
+- `print_jobs`: Queue containing `employee_name`, `receipt_token` (guest tracking), `lease_token` (agent lease), and settings.
+- `system_settings`: Persists `queue_paused` and `max_copies_limit`.
+- `agents`: Gateway agent enrollment metadata.
+- `audit_logs`: Audit trail for queue operations.
 
-Execute migrations from `apps/api`:
+### Executing Migrations:
 
 ```bash
-# Local testing migration:
+# Local development:
 npx wrangler d1 execute print-bridge-d1 --local --file=./migrations/0001_init.sql
 
-# Production deployment migration:
+# Production deployment:
 npx wrangler d1 execute print-bridge-d1 --remote --file=./migrations/0001_init.sql
 ```
 
 ---
 
-## 8. Deploying the Application
+## 4. Deploying the Application
 
 From `apps/api`:
 
@@ -135,16 +65,31 @@ From `apps/api`:
 npx wrangler deploy
 ```
 
-This single command deploys:
-1. The API endpoints (`/api/*`).
-2. The public guest UI (`/`) and admin dashboard (`/admin`) via Workers Static Assets.
-3. The scheduled retention cron worker.
+This command publishes:
+1. API routing (`/api/*`).
+2. Public guest web UI (`/`) and private admin dashboard (`/admin`) via Workers Static Assets.
+3. Retention cleanup cron trigger (`*/15 * * * *`).
 
 ---
 
-## 9. Usage, Free-Tier Budgets & Billing Monitoring
+## 5. Deployment Verification Checklist
 
-Monitor consumption at **Compute (Workers)** and **R2** in the Cloudflare dashboard:
-- **Workers Requests**: Free tier provides 100,000 requests/day (3,000,000/month). Typical office usage (40 jobs/day with polling) is ~250,000 requests/month (<10% of free limit).
-- **R2 Storage**: Free tier provides 10 GB-months. Active queue storage rarely exceeds 500 MB.
-- **D1 Reads & Writes**: Free tier provides 5 million reads/day and 100,000 writes/day.
+1. **Safety Checkpoint**: Verify queue remains paused (`queue_paused=true`) until ready.
+2. **Admin Dashboard**:
+   - Access `https://<worker-domain>/admin`.
+   - Log in using `admin123` and the configured `ADMIN_PASSWORD`.
+   - Confirm queue is reported as **Queue Paused**.
+3. **Gateway Agent**:
+   - Run diagnostics on the Windows 10 gateway machine:
+     ```cmd
+     set PB_API_URL=https://<worker-domain>
+     set PB_AGENT_KEY=<your-agent-key>
+     PrintBridgeAgent.exe --diagnose
+     ```
+   - Verify network printer reachability to `\\SILVERTOUCH-PC\HP LaserJet Professional M1136 MFP`.
+   - Test polling in safe dry-run mode:
+     ```cmd
+     PrintBridgeAgent.exe --single-poll --dry-run
+     ```
+4. **Queue Unpause**:
+   - When verified, click **Resume Queue** on the `/admin` dashboard.

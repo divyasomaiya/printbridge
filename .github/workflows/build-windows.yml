@@ -1,34 +1,42 @@
-
-name: Build PrintBridge Windows Agent
+name: Build Windows Agent
 
 on:
-  workflow_dispatch:
-
-permissions:
-  contents: read
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
 
 jobs:
-  build-windows:
+  build:
+    name: Build & Test Windows Agent
     runs-on: windows-latest
 
     steps:
-      - name: Checkout repository
+      - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install .NET 8 SDK
+      - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
 
-      - name: Test Windows Agent
-        run: dotnet test apps/windows-agent/PrintBridgeAgent.Tests/PrintBridgeAgent.Tests.csproj -c Release
+      - name: Restore dependencies
+        run: dotnet restore apps/windows-agent/PrintBridgeAgent.sln
 
-      - name: Publish Windows x64 EXE
-        run: dotnet publish apps/windows-agent/PrintBridgeAgent/PrintBridgeAgent.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish/windows-x64
+      - name: Run Windows Agent Tests
+        run: dotnet test apps/windows-agent/PrintBridgeAgent.Tests/PrintBridgeAgent.Tests.csproj --no-restore --verbosity normal
 
-      - name: Upload Windows EXE
+      - name: Publish self-contained Windows x64 executable
+        run: |
+          dotnet publish apps/windows-agent/PrintBridgeAgent/PrintBridgeAgent.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -o apps/windows-agent/dist
+
+      - name: Upload Windows Agent artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PrintBridge-Windows-x64
-          path: publish/windows-x64/
-          retention-days: 7
+          name: PrintBridgeAgent-win-x64
+          path: apps/windows-agent/dist/PrintBridgeAgent.exe

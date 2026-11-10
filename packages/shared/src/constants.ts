@@ -7,26 +7,27 @@ export const JOB_EXPIRATION_HOURS = 24;
 /**
  * HP LaserJet Professional M1136 MFP capability profile.
  * Physical hardware characteristics:
+ * - Computer name: SILVERTOUCH-PC (Windows 7, 2 GB RAM)
  * - Monochrome laser printer (Grayscale only)
  * - Single-sided printing only (No auto-duplex hardware)
  * - Supported paper: A4, Letter, Legal
  * - Max copies: 99
  * - Manual duplex requires physical human paper re-insertion and is NOT unattended.
- * Note: Configurable UNC share path, defaulting to standard shared office printer name.
+ * CRITICAL: SILVERTOUCH-PC must NEVER be accessed directly or modified.
  */
 export const HP_LASERJET_M1136_CAPABILITY: PrinterCapability = {
   id: 'hp-laserjet-m1136',
   name: 'HP LaserJet Professional M1136 MFP',
-  host: 'OFFICE-HOST',
+  host: 'SILVERTOUCH-PC',
   shareName: 'HP LaserJet Professional M1136 MFP',
-  fullUncPath: '\\\\OFFICE-HOST\\HP LaserJet Professional M1136 MFP',
+  fullUncPath: '\\\\SILVERTOUCH-PC\\HP LaserJet Professional M1136 MFP',
   isOnline: true,
   supportsColor: false,
   supportsAutoDuplex: false,
   supportsManualDuplex: true,
   supportedPaperSizes: ['a4', 'letter', 'legal'],
   maxCopies: 99,
-  description: 'Shared monochrome office laser printer on office host'
+  description: 'Shared monochrome office laser printer on SILVERTOUCH-PC'
 };
 
 export const MOCK_PRINTER_CAPABILITY: PrinterCapability = {
@@ -222,37 +223,30 @@ export function validateUploadedFile(
     return { isValid: false, error: `Unsupported file extension '${ext}'. Supported extensions: ${Object.keys(SUPPORTED_EXTENSIONS_MAP).join(', ')}` };
   }
 
-  // Validate magic bytes if provided
   if (headerBytes && headerBytes.length >= 4) {
     if (format === 'pdf') {
-      // %PDF- (0x25 0x50 0x44 0x46)
       if (headerBytes[0] !== 0x25 || headerBytes[1] !== 0x50 || headerBytes[2] !== 0x44 || headerBytes[3] !== 0x46) {
         return { isValid: false, error: 'File content does not match standard PDF header magic bytes.' };
       }
     } else if (format === 'png') {
-      // 0x89 0x50 0x4E 0x47
       if (headerBytes[0] !== 0x89 || headerBytes[1] !== 0x50 || headerBytes[2] !== 0x4E || headerBytes[3] !== 0x47) {
         return { isValid: false, error: 'File content does not match PNG magic bytes.' };
       }
     } else if (format === 'jpg' || format === 'jpeg') {
-      // 0xFF 0xD8 0xFF
       if (headerBytes[0] !== 0xFF || headerBytes[1] !== 0xD8 || headerBytes[2] !== 0xFF) {
         return { isValid: false, error: 'File content does not match JPEG magic bytes.' };
       }
     } else if (format === 'bmp') {
-      // BM (0x42 0x4D)
       if (headerBytes[0] !== 0x42 || headerBytes[1] !== 0x4D) {
         return { isValid: false, error: 'File content does not match BMP magic bytes.' };
       }
     } else if (format === 'tif' || format === 'tiff') {
-      // II (0x49 0x49 0x2A 0x00) or MM (0x4D 0x4D 0x00 0x2A)
       const isLittleEndian = headerBytes[0] === 0x49 && headerBytes[1] === 0x49 && headerBytes[2] === 0x2A;
       const isBigEndian = headerBytes[0] === 0x4D && headerBytes[1] === 0x4D && headerBytes[2] === 0x00 && headerBytes[3] === 0x2A;
       if (!isLittleEndian && !isBigEndian) {
         return { isValid: false, error: 'File content does not match TIFF magic bytes.' };
       }
     } else if (format === 'docx' || format === 'xlsx' || format === 'pptx') {
-      // ZIP header PK (0x50 0x4B 0x03 0x04)
       if (headerBytes[0] !== 0x50 || headerBytes[1] !== 0x4B) {
         return { isValid: false, error: `File content for OpenXML format ${format.toUpperCase()} does not match ZIP package header.` };
       }

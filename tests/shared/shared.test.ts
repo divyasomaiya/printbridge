@@ -13,7 +13,7 @@ test('HP LaserJet M1136 capability profile validation', () => {
   assert.equal(HP_LASERJET_M1136_CAPABILITY.supportsColor, false);
   assert.equal(HP_LASERJET_M1136_CAPABILITY.supportsAutoDuplex, false);
   assert.equal(HP_LASERJET_M1136_CAPABILITY.supportsManualDuplex, true);
-  assert.equal(HP_LASERJET_M1136_CAPABILITY.host, 'OFFICE-HOST');
+  assert.equal(HP_LASERJET_M1136_CAPABILITY.host, 'SILVERTOUCH-PC');
 });
 
 test('validatePrintSettings rejects color on monochrome printer', () => {
