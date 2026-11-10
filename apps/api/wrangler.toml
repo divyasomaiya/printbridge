@@ -14,7 +14,7 @@ DEFAULT_TENANT_ID = "dtc-office"
 [[d1_databases]]
 binding = "DB"
 database_name = "print-bridge-d1"
-database_id = "00000000-0000-0000-0000-000000000000" # Replace with real D1 database ID from wrangler d1 create
+database_id = "3aa0a5f9-6087-46ea-ba88-e57727f6073b" # Replace with real D1 database ID from wrangler d1 create
 
 [[r2_buckets]]
 binding = "STORAGE"
