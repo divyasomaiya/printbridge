@@ -1,6 +1,7 @@
 "use strict";
-// Print Bridge Web Client logic
+// Print Bridge Public Guest Web Client
 document.addEventListener('DOMContentLoaded', () => {
+    const guestNameInput = document.getElementById('guestNameInput');
     const dropzone = document.getElementById('dropzone');
     const fileInput = document.getElementById('fileInput');
     const fileInfo = document.getElementById('fileInfo');
@@ -21,65 +22,15 @@ document.addEventListener('DOMContentLoaded', () => {
     const statusSection = document.getElementById('statusSection');
     const statusText = document.getElementById('statusText');
     const statusDetails = document.getElementById('statusDetails');
-    const authStatusText = document.getElementById('authStatusText');
-    const authBtn = document.getElementById('authBtn');
-    const authDialog = document.getElementById('authDialog');
-    const employeePasskeyInput = document.getElementById('employeePasskeyInput');
-    const saveAuthBtn = document.getElementById('saveAuthBtn');
-    const cancelAuthBtn = document.getElementById('cancelAuthBtn');
     let selectedFile = null;
-    // Manage employee session token in localStorage. Raw PINs/secrets are NEVER stored.
-    function getStoredSessionToken() {
-        return localStorage.getItem('pb_session_token');
+    // Restore saved guest name if previously entered
+    const savedName = localStorage.getItem('pb_guest_name');
+    if (savedName)
+        guestNameInput.value = savedName;
+    guestNameInput.addEventListener('input', updateSubmitButtonState);
+    function updateSubmitButtonState() {
+        submitJobBtn.disabled = !selectedFile || !guestNameInput.value.trim();
     }
-    function updateAuthUI() {
-        const token = getStoredSessionToken();
-        if (token) {
-            authStatusText.textContent = 'Device Authorized (Active Office Session)';
-            authStatusText.style.color = '#15803d';
-            authBtn.textContent = 'Change PIN';
-        }
-        else {
-            authStatusText.textContent = 'Authorization required before printing';
-            authStatusText.style.color = '#b45309';
-            authBtn.textContent = 'Enter Office PIN';
-        }
-    }
-    authBtn.addEventListener('click', () => {
-        authDialog.style.display = 'block';
-        employeePasskeyInput.focus();
-    });
-    cancelAuthBtn.addEventListener('click', () => {
-        authDialog.style.display = 'none';
-    });
-    saveAuthBtn.addEventListener('click', async () => {
-        const passkey = employeePasskeyInput.value.trim();
-        if (!passkey)
-            return;
-        try {
-            // Exchange PIN with backend to receive signed short-lived session token
-            const res = await fetch('/api/auth/session', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ passkey })
-            });
-            const data = await res.json();
-            if (res.ok && data.token) {
-                localStorage.setItem('pb_session_token', data.token);
-                authDialog.style.display = 'none';
-                employeePasskeyInput.value = '';
-                updateAuthUI();
-            }
-            else {
-                alert(data.error || 'Authorization failed: Invalid office PIN.');
-            }
-        }
-        catch {
-            // SECURITY FIX: Never accept unverified PINs as fallback on network error
-            alert('Network error: Unable to contact authentication server to verify credentials.');
-        }
-    });
-    updateAuthUI();
     // Dropzone drag-and-drop
     dropzone.addEventListener('click', () => fileInput.click());
     dropzone.addEventListener('dragover', (e) => {
@@ -106,14 +57,14 @@ document.addEventListener('DOMContentLoaded', () => {
         fileInput.value = '';
         dropzone.style.display = 'block';
         fileInfo.style.display = 'none';
-        submitJobBtn.disabled = true;
+        updateSubmitButtonState();
     });
     function handleFileSelected(file) {
         selectedFile = file;
         fileNameDisplay.textContent = `${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
         dropzone.style.display = 'none';
         fileInfo.style.display = 'flex';
-        submitJobBtn.disabled = false;
+        updateSubmitButtonState();
     }
     // Page range toggle
     pageRangeSelect.addEventListener('change', () => {
@@ -142,15 +93,10 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     // Submit print job
     submitJobBtn.addEventListener('click', async () => {
-        if (!selectedFile)
+        const guestName = guestNameInput.value.trim();
+        if (!selectedFile || !guestName)
             return;
-        const sessionToken = getStoredSessionToken();
-        const headers = {
-            'Content-Type': 'application/json'
-        };
-        if (sessionToken) {
-            headers['Authorization'] = `Bearer ${sessionToken}`;
-        }
+        localStorage.setItem('pb_guest_name', guestName);
         submitJobBtn.disabled = true;
         statusSection.style.display = 'block';
         statusText.textContent = 'Uploading document...';
@@ -159,6 +105,7 @@ document.addEventListener('DOMContentLoaded', () => {
         reader.onload = async () => {
             const base64Data = reader.result.split(',')[1];
             const payload = {
+                guestName,
                 printerId: printerSelect.value,
                 filename: selectedFile.name,
                 fileBase64: base64Data,
@@ -177,17 +124,21 @@ document.addEventListener('DOMContentLoaded', () => {
             try {
                 const response = await fetch('/api/jobs', {
                     method: 'POST',
-                    headers,
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
                 });
                 const resData = await response.json();
                 if (response.ok && resData.success) {
+                    const receiptToken = resData.receiptToken;
                     statusText.textContent = 'Print Job Enqueued';
-                    statusDetails.textContent = `Job ID: ${resData.job.id} — Waiting for Windows gateway...`;
-                    // Track job status periodically
+                    statusDetails.textContent = `Job ID: ${resData.job.id} (Guest: ${guestName}) — Waiting for office gateway...`;
+                    // Track job status periodically using the secure receipt token
                     const pollInterval = setInterval(async () => {
                         try {
-                            const stRes = await fetch(`/api/jobs/${resData.job.id}`, { headers });
+                            const url = receiptToken
+                                ? `/api/jobs/${resData.job.id}?receiptToken=${receiptToken}`
+                                : `/api/jobs/${resData.job.id}`;
+                            const stRes = await fetch(url);
                             if (stRes.ok) {
                                 const jobStatus = await stRes.json();
                                 statusText.textContent = `Status: ${jobStatus.status.toUpperCase()}`;
@@ -203,11 +154,6 @@ document.addEventListener('DOMContentLoaded', () => {
                     }, 3000);
                 }
                 else {
-                    if (response.status === 401) {
-                        localStorage.removeItem('pb_session_token');
-                        updateAuthUI();
-                        authDialog.style.display = 'block';
-                    }
                     statusText.textContent = 'Submission Rejected';
                     statusDetails.textContent = resData.error || 'Unknown error occurred.';
                 }

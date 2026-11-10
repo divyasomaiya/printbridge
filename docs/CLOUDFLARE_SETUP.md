@@ -80,24 +80,24 @@ Do **NOT** put secrets in git repositories. Run these commands from your local t
 npx wrangler secret put GATEWAY_API_KEY
 # Enter a high-entropy secret (e.g., 32 random characters)
 
-# Set the office employee access passkey / secret for signed session tokens
-npx wrangler secret put EMPLOYEE_AUTH_SECRET
-# Enter your office employee PIN or passkey
+# Set the private admin password for the /admin dashboard (username: admin123)
+npx wrangler secret put ADMIN_PASSWORD
+# Enter your private administrator password
 ```
 
 ---
 
-## 6. Configuring Cloudflare Access (Zero Trust) for Office Employees
+## 6. Two Separate Interfaces
 
-To enable seamless single sign-on without PINs:
-
-1. Navigate to **Zero Trust** in the Cloudflare Dashboard.
-2. Go to **Access** > **Applications** > **Add an application** > **Self-hosted**.
-3. Name: `Print Bridge Office`.
-4. Domain: `print.your-office-domain.com`.
-5. Set an Access Policy allowing authorized employee email domains (e.g., `@yourcompany.com`).
-6. Copy the **Application Audience (AUD) Tag** from the Access overview and paste it into `CF_ACCESS_AUD` in `wrangler.toml`.
-7. When enabled, Cloudflare automatically injects the cryptographically signed `Cf-Access-Jwt-Assertion` header into requests. The backend verifies the JWT signature, audience, and expiration to authenticate employees without entering a PIN.
+1. **Public/Guest Printing (`/`)**:
+   - For employees, clients, and guests.
+   - Flow: **Open Website → Enter Name → Select Document → Choose Print Settings → Print**.
+   - No login, registration, or password required.
+   - Status tracking is secured via unguessable receipt tokens.
+2. **Private Administrator Dashboard (`/admin`)**:
+   - For the owner/staff.
+   - Login username: `admin123`.
+   - Live queue table with guest names, timestamps, printer status, pause/resume queue button, and job cancellation.
 
 ---
 
@@ -125,50 +125,14 @@ npx wrangler deploy
 
 This single command deploys:
 1. The API endpoints (`/api/*`).
-2. The frontend web UI via Workers Static Assets.
+2. The public guest UI (`/`) and admin dashboard (`/admin`) via Workers Static Assets.
 3. The scheduled retention cron worker.
 
 ---
 
-## 9. Verifying the Deployment
-
-1. **Web UI Verification**:
-   - Open your deployed worker URL in a browser (or scan QR code).
-   - Enter your office PIN to generate a signed session token, or authenticate via Cloudflare Access.
-   - Confirm printer profile displays `HP LaserJet Professional M1136 MFP (Shared Office Printer)`.
-2. **Enqueue Verification**:
-   - Upload a test file (e.g. `test.pdf`) and click **Print Document**.
-   - Note the returned Job ID and status `ENQUEUED`.
-3. **Gateway Verification**:
-   - On the Windows 10 gateway machine, launch the agent:
-     ```cmd
-     set PB_API_URL=https://<your-worker-subdomain>.workers.dev
-     set PB_AGENT_KEY=<your-agent-key>
-     PrintBridgeAgent.exe --diagnose
-     ```
-   - Run a single polling test with `--single-poll --dry-run` to verify claim and download without printing physical paper.
-4. **Retention Verification**:
-   - Check the R2 bucket in Cloudflare dashboard after job completion: confirmed that the document was wiped immediately upon handoff.
-
----
-
-## 10. Usage, Free-Tier Budgets & Billing Monitoring
+## 9. Usage, Free-Tier Budgets & Billing Monitoring
 
 Monitor consumption at **Compute (Workers)** and **R2** in the Cloudflare dashboard:
 - **Workers Requests**: Free tier provides 100,000 requests/day (3,000,000/month). Typical office usage (40 jobs/day with polling) is ~250,000 requests/month (<10% of free limit).
 - **R2 Storage**: Free tier provides 10 GB-months. Active queue storage rarely exceeds 500 MB.
 - **D1 Reads & Writes**: Free tier provides 5 million reads/day and 100,000 writes/day.
-
----
-
-## 11. Safe Rollback Instructions
-
-If a rollback is required:
-1. View recent deployments:
-   ```bash
-   npx wrangler deployments list
-   ```
-2. Roll back to a previous healthy version:
-   ```bash
-   npx wrangler rollback <deployment-id>
-   ```

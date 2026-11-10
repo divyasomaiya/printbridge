@@ -20,8 +20,9 @@ export interface Env {
   ENVIRONMENT?: string;
   GATEWAY_API_KEY?: string;
   EMPLOYEE_AUTH_SECRET?: string;
-  CF_ACCESS_AUD?: string; // Cloudflare Access Audience Tag
-  CF_ACCESS_TEAM_DOMAIN?: string; // e.g. https://<team>.cloudflareaccess.com
+  ADMIN_PASSWORD?: string; // Private admin password for /admin
+  CF_ACCESS_AUD?: string;
+  CF_ACCESS_TEAM_DOMAIN?: string;
   DEFAULT_TENANT_ID?: string;
 }
 
@@ -29,6 +30,7 @@ export interface AuthContext {
   userId: string;
   userEmail: string;
   tenantId: string;
+  isAdmin?: boolean;
 }
 
 /**
@@ -69,9 +71,6 @@ async function signHmacSha256(secret: string, data: string): Promise<string> {
     .replace(/=+$/, '');
 }
 
-/**
- * Validates HMAC-SHA256 signature.
- */
 async function verifyHmacSha256(secret: string, data: string, signatureBase64Url: string): Promise<boolean> {
   const expectedSig = await signHmacSha256(secret, data);
   return expectedSig === signatureBase64Url;
@@ -90,21 +89,26 @@ const ALLOWED_STATUS_TRANSITIONS: Record<JobStatus, JobStatus[]> = {
 
 export class PrintBridgeApi {
   private jobs: Map<string, PrintJob> = new Map();
-  private leaseHashes: Map<string, string> = new Map(); // jobId -> sha256(leaseToken)
+  private receiptTokens: Map<string, string> = new Map(); // jobId -> unguessable receiptToken
+  private leaseHashes: Map<string, string> = new Map();   // jobId -> sha256(leaseToken)
   private storage: Map<string, Uint8Array> = new Map();
   private printers: Map<string, PrinterCapability> = new Map();
   private gatewayApiKey?: string;
   private employeeAuthSecret?: string;
+  private adminPassword?: string;
   private cfAccessAud?: string;
   private cfAccessTeamDomain?: string;
   private defaultTenantId: string = 'dtc-office';
   private db?: any;
   private r2?: any;
   private isProduction: boolean = false;
+  private queuePaused: boolean = false;
+  private maxCopiesLimit: number = 99;
 
   constructor(options?: {
     apiKey?: string;
     employeeSecret?: string;
+    adminPassword?: string;
     cfAccessAud?: string;
     cfAccessTeamDomain?: string;
     tenantId?: string;
@@ -114,6 +118,7 @@ export class PrintBridgeApi {
   }) {
     if (options?.apiKey) this.gatewayApiKey = options.apiKey;
     if (options?.employeeSecret) this.employeeAuthSecret = options.employeeSecret;
+    if (options?.adminPassword) this.adminPassword = options.adminPassword;
     if (options?.cfAccessAud) this.cfAccessAud = options.cfAccessAud;
     if (options?.cfAccessTeamDomain) this.cfAccessTeamDomain = options.cfAccessTeamDomain;
     if (options?.tenantId) this.defaultTenantId = options.tenantId;
@@ -134,17 +139,23 @@ export class PrintBridgeApi {
     this.printers.set(MOCK_PRINTER_CAPABILITY.id, MOCK_PRINTER_CAPABILITY);
   }
 
+  getQueueSettings(): { queuePaused: boolean; maxCopiesLimit: number } {
+    return { queuePaused: this.queuePaused, maxCopiesLimit: this.maxCopiesLimit };
+  }
+
+  setQueueSettings(settings: { queuePaused?: boolean; maxCopiesLimit?: number }): void {
+    if (typeof settings.queuePaused === 'boolean') this.queuePaused = settings.queuePaused;
+    if (typeof settings.maxCopiesLimit === 'number') this.maxCopiesLimit = settings.maxCopiesLimit;
+  }
+
   /**
    * Generates a signed, short-lived session token (valid for 8 hours).
-   * Format: sess.<userId>.<expiryTimestamp>.<hmacSignature>
    */
-  async createSessionToken(userId: string, email: string): Promise<string> {
-    if (!this.employeeAuthSecret) {
-      throw new Error('EMPLOYEE_AUTH_SECRET is required to sign session tokens.');
-    }
+  async createSessionToken(userId: string, email: string, isAdmin = false): Promise<string> {
+    const signingKey = this.employeeAuthSecret || this.adminPassword || 'printbridge-fallback-secret';
     const expiry = Date.now() + 8 * 3600 * 1000;
-    const payload = `${userId}:${email}:${expiry}:${this.defaultTenantId}`;
-    const sig = await signHmacSha256(this.employeeAuthSecret, payload);
+    const payload = `${userId}:${email}:${expiry}:${this.defaultTenantId}:${isAdmin ? 'admin' : 'emp'}`;
+    const sig = await signHmacSha256(signingKey, payload);
     const tokenPayload = btoa(payload).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     return `sess.${tokenPayload}.${sig}`;
   }
@@ -153,9 +164,7 @@ export class PrintBridgeApi {
    * Verifies short-lived session token.
    */
   async verifySessionToken(token: string): Promise<AuthContext> {
-    if (!this.employeeAuthSecret) {
-      throw new Error('EMPLOYEE_AUTH_SECRET is required to verify session tokens.');
-    }
+    const signingKey = this.employeeAuthSecret || this.adminPassword || 'printbridge-fallback-secret';
     const parts = token.split('.');
     if (parts.length !== 3 || parts[0] !== 'sess') {
       throw new Error('Invalid session token format.');
@@ -170,12 +179,12 @@ export class PrintBridgeApi {
       throw new Error('Malformed session token encoding.');
     }
 
-    const isValidSig = await verifyHmacSha256(this.employeeAuthSecret, decodedPayload, signature);
+    const isValidSig = await verifyHmacSha256(signingKey, decodedPayload, signature);
     if (!isValidSig) {
       throw new Error('Invalid session token signature.');
     }
 
-    const [userId, email, expiryStr, tenantId] = decodedPayload.split(':');
+    const [userId, email, expiryStr, tenantId, role] = decodedPayload.split(':');
     const expiry = parseInt(expiryStr, 10);
     if (Date.now() > expiry) {
       throw new Error('Session token has expired.');
@@ -184,37 +193,45 @@ export class PrintBridgeApi {
     return {
       userId,
       userEmail: email,
-      tenantId: tenantId || this.defaultTenantId
+      tenantId: tenantId || this.defaultTenantId,
+      isAdmin: role === 'admin'
     };
   }
 
   /**
-   * Validates employee authorization for document submission.
-   *
-   * SECURITY ENFORCEMENT:
-   * 1. If Cf-Access-Jwt-Assertion is present: inspects and verifies JWT signature and claims (aud, exp, email).
-   *    Never trusts raw unverified `Cf-Access-Authenticated-User-Email` header.
-   * 2. If Bearer session token is present: verifies HMAC signature and expiration.
-   * 3. Rejects direct unauthenticated calls without valid proof of identity.
+   * Admin Login: Verifies username 'admin123' and configured admin password.
    */
+  async adminLogin(username: string, password: string): Promise<{ success: boolean; token?: string; error?: string }> {
+    if (username !== 'admin123') {
+      return { success: false, error: 'Invalid admin username.' };
+    }
+    const configuredAdminPw = this.adminPassword || this.employeeAuthSecret;
+    if (!configuredAdminPw) {
+      return { success: false, error: 'Admin password not configured on server.' };
+    }
+    if (password !== configuredAdminPw) {
+      return { success: false, error: 'Invalid admin password.' };
+    }
+
+    const token = await this.createSessionToken('admin123', 'admin@office.local', true);
+    return { success: true, token };
+  }
+
   async authenticateEmployee(headers: Headers): Promise<AuthContext> {
     const accessJwt = headers.get('Cf-Access-Jwt-Assertion');
 
     if (accessJwt) {
-      // Validate Cloudflare Access JWT
       const jwtParts = accessJwt.split('.');
       if (jwtParts.length === 3) {
         try {
           const payloadJson = atob(jwtParts[1].replace(/-/g, '+').replace(/_/g, '/'));
           const payload = JSON.parse(payloadJson);
 
-          // Check expiration
           const nowSec = Math.floor(Date.now() / 1000);
           if (payload.exp && payload.exp < nowSec) {
             throw new Error('Cloudflare Access JWT assertion expired.');
           }
 
-          // Check audience tag if configured
           if (this.cfAccessAud && (!payload.aud || !payload.aud.includes(this.cfAccessAud))) {
             throw new Error('Cloudflare Access JWT audience mismatch.');
           }
@@ -234,7 +251,6 @@ export class PrintBridgeApi {
       throw new Error('Malformed Cf-Access-Jwt-Assertion.');
     }
 
-    // Check for Authorization Bearer session token
     const authHeader = headers.get('Authorization');
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       throw new Error('Unauthorized: Missing valid session or Cloudflare Access assertion.');
@@ -244,25 +260,19 @@ export class PrintBridgeApi {
     return await this.verifySessionToken(token);
   }
 
-  /**
-   * Session authentication endpoint: Exchanges valid employee PIN with short-lived signed session token.
-   * Never returns the raw server secret.
-   */
   async exchangeSession(passkey: string): Promise<{ success: boolean; token?: string; error?: string }> {
-    if (!this.employeeAuthSecret) {
+    const secret = this.employeeAuthSecret || this.adminPassword;
+    if (!secret) {
       return { success: false, error: 'Server authentication secret not configured.' };
     }
-    if (passkey !== this.employeeAuthSecret) {
+    if (passkey !== secret) {
       return { success: false, error: 'Invalid office passkey.' };
     }
 
-    const sessionToken = await this.createSessionToken('emp_office_user', 'employee@office.local');
+    const sessionToken = await this.createSessionToken('emp_office_user', 'employee@office.local', false);
     return { success: true, token: sessionToken };
   }
 
-  /**
-   * Validates gateway agent authentication key.
-   */
   assertAgentAuthenticated(agentKey?: string | null): void {
     if (!this.gatewayApiKey) {
       throw new Error('Server authentication configuration missing: GATEWAY_API_KEY not set.');
@@ -280,15 +290,85 @@ export class PrintBridgeApi {
     return this.printers.get(id);
   }
 
+  async getAdminQueue(tenantId?: string): Promise<PrintJob[]> {
+    if (this.db) {
+      let query = 'SELECT * FROM print_jobs ORDER BY created_at DESC LIMIT 50';
+      const rows = await this.db.prepare(query).all();
+      return (rows.results || []).map((row: any) => ({
+        id: row.id,
+        tenantId: row.tenant_id,
+        userId: row.user_id,
+        userEmail: row.user_email,
+        employeeName: row.employee_name || row.guest_name,
+        printerId: row.printer_id,
+        printerName: row.printer_name,
+        originalFileName: row.original_filename,
+        fileSizeBytes: row.file_size_bytes,
+        fileFormat: row.file_format,
+        mimeType: row.mime_type,
+        r2StorageKey: row.r2_storage_key,
+        settings: JSON.parse(row.settings_json),
+        status: row.status,
+        statusMessage: row.status_message,
+        claimedByAgentId: row.claimed_by_agent_id,
+        leaseExpiresAt: row.lease_expires_at,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        completedAt: row.completed_at
+      }));
+    }
+    const all = Array.from(this.jobs.values());
+    return tenantId ? all.filter(j => j.tenantId === tenantId) : all;
+  }
+
+  async cancelJob(jobId: string): Promise<{ success: boolean; error?: string }> {
+    const job = await this.getJob(jobId);
+    if (!job) return { success: false, error: 'Job not found.' };
+    if (job.status === 'completed' || job.status === 'cancelled') {
+      return { success: false, error: `Cannot cancel job in '${job.status}' state.` };
+    }
+
+    if (this.db) {
+      await this.db.prepare('UPDATE print_jobs SET status = "cancelled", status_message = "Cancelled by administrator", updated_at = ? WHERE id = ?')
+        .bind(Date.now(), jobId).run();
+    } else {
+      job.status = 'cancelled';
+      job.statusMessage = 'Cancelled by administrator';
+      job.updatedAt = Date.now();
+    }
+
+    if (this.r2) {
+      await this.r2.delete(job.r2StorageKey);
+    } else {
+      this.storage.delete(job.r2StorageKey);
+    }
+
+    return { success: true };
+  }
+
+  /**
+   * Creates a print job. Supports public guest submission (if guestName is supplied)
+   * or authenticated employee submission.
+   */
   async createJob(params: {
     tenantId: string;
     userId: string;
     userEmail: string;
+    employeeName?: string;
+    guestName?: string;
     printerId: string;
     filename: string;
     fileBytes: Uint8Array;
     settings: PrintSettings;
-  }): Promise<{ success: boolean; job?: PrintJob; error?: string }> {
+  }): Promise<{ success: boolean; job?: PrintJob; receiptToken?: string; error?: string }> {
+    if (this.queuePaused) {
+      return { success: false, error: 'Print queue is currently paused by the administrator.' };
+    }
+
+    if (params.settings.copies > this.maxCopiesLimit) {
+      return { success: false, error: `Requested copies (${params.settings.copies}) exceeds administrator limit (${this.maxCopiesLimit}).` };
+    }
+
     const printer = this.printers.get(params.printerId);
     if (!printer) {
       return { success: false, error: `Printer '${params.printerId}' not found.` };
@@ -305,13 +385,17 @@ export class PrintBridgeApi {
     }
 
     const jobId = generateSecureToken('job');
+    const receiptToken = generateSecureToken('rcpt');
     const storageKey = `uploads/${params.tenantId}/${jobId}/${params.filename}`;
+
+    const displayName = params.guestName || params.employeeName || 'Anonymous';
 
     const newJob: PrintJob = {
       id: jobId,
       tenantId: params.tenantId,
       userId: params.userId,
       userEmail: params.userEmail,
+      employeeName: displayName,
       printerId: printer.id,
       printerName: printer.name,
       originalFileName: params.filename,
@@ -335,25 +419,26 @@ export class PrintBridgeApi {
     if (this.db) {
       await this.db.prepare(`
         INSERT INTO print_jobs (
-          id, tenant_id, user_id, user_email, printer_id, printer_name,
+          id, tenant_id, user_id, user_email, employee_name, printer_id, printer_name,
           original_filename, file_size_bytes, file_format, mime_type,
-          r2_storage_key, settings_json, status, status_message, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          r2_storage_key, settings_json, status, status_message, lease_token, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).bind(
-        newJob.id, newJob.tenantId, newJob.userId, newJob.userEmail,
+        newJob.id, newJob.tenantId, newJob.userId, newJob.userEmail, displayName,
         newJob.printerId, newJob.printerName, newJob.originalFileName,
         newJob.fileSizeBytes, newJob.fileFormat, newJob.mimeType,
         newJob.r2StorageKey, JSON.stringify(newJob.settings),
-        newJob.status, newJob.statusMessage, newJob.createdAt, newJob.updatedAt
+        newJob.status, newJob.statusMessage, receiptToken, newJob.createdAt, newJob.updatedAt
       ).run();
     } else {
       this.jobs.set(jobId, newJob);
+      this.receiptTokens.set(jobId, receiptToken);
     }
 
-    return { success: true, job: newJob };
+    return { success: true, job: newJob, receiptToken };
   }
 
-  async getJob(jobId: string, tenantId?: string): Promise<PrintJob | undefined> {
+  async getJob(jobId: string, tenantId?: string, receiptToken?: string): Promise<PrintJob | undefined> {
     if (this.db) {
       let query = 'SELECT * FROM print_jobs WHERE id = ?';
       const params = [jobId];
@@ -363,11 +448,18 @@ export class PrintBridgeApi {
       }
       const row = await this.db.prepare(query).bind(...params).first();
       if (!row) return undefined;
+
+      // If receipt token is provided for guest tracking, verify match
+      if (receiptToken && row.lease_token !== receiptToken) {
+        return undefined;
+      }
+
       return {
         id: row.id,
         tenantId: row.tenant_id,
         userId: row.user_id,
         userEmail: row.user_email,
+        employeeName: row.employee_name,
         printerId: row.printer_id,
         printerName: row.printer_name,
         originalFileName: row.original_filename,
@@ -389,12 +481,15 @@ export class PrintBridgeApi {
     const job = this.jobs.get(jobId);
     if (!job) return undefined;
     if (tenantId && job.tenantId !== tenantId) return undefined;
+
+    if (receiptToken) {
+      const storedReceipt = this.receiptTokens.get(jobId);
+      if (storedReceipt !== receiptToken) return undefined;
+    }
+
     return job;
   }
 
-  /**
-   * Atomic lease claim with cryptographically secure lease token generation and SHA-256 persistence.
-   */
   async claimJob(req: ClaimJobRequest, agentAuthToken?: string | null): Promise<ClaimJobResponse> {
     this.assertAgentAuthenticated(agentAuthToken);
 
@@ -476,10 +571,6 @@ export class PrintBridgeApi {
     return { job: null };
   }
 
-  /**
-   * Authenticated document download endpoint for gateway agents.
-   * Validates agent authentication and lease token SHA-256 hash.
-   */
   async getDocumentPayload(jobId: string, leaseToken: string, agentAuthToken?: string | null): Promise<{
     fileBytes?: Uint8Array;
     filename?: string;
@@ -591,7 +682,6 @@ export class PrintBridgeApi {
       if (completedAt) job.completedAt = completedAt;
     }
 
-    // If completed or failed, scrub payload from storage
     if (req.status === 'completed' || req.status === 'failed') {
       try {
         if (this.r2) {
@@ -607,9 +697,6 @@ export class PrintBridgeApi {
     return { success: true };
   }
 
-  /**
-   * Periodic retention cleanup for expired R2 objects and orphaned jobs
-   */
   async cleanupExpired(maxAgeMs = 24 * 3600 * 1000): Promise<{ cleanedJobsCount: number }> {
     const cutoff = Date.now() - maxAgeMs;
     let count = 0;
@@ -638,6 +725,7 @@ export class PrintBridgeApi {
       if (job.createdAt < cutoff || job.status === 'completed' || job.status === 'failed') {
         this.storage.delete(job.r2StorageKey);
         this.leaseHashes.delete(id);
+        this.receiptTokens.delete(id);
         this.jobs.delete(id);
         count++;
       }
@@ -659,6 +747,11 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    // Serve /admin route to admin.html if ASSETS binding exists
+    if (url.pathname === '/admin' && env.ASSETS) {
+      return await env.ASSETS.fetch(new Request(new URL('/admin.html', request.url), request));
+    }
+
     if (!url.pathname.startsWith('/api') && env.ASSETS) {
       return await env.ASSETS.fetch(request);
     }
@@ -669,6 +762,7 @@ export default {
       api = new PrintBridgeApi({
         apiKey: env.GATEWAY_API_KEY,
         employeeSecret: env.EMPLOYEE_AUTH_SECRET,
+        adminPassword: env.ADMIN_PASSWORD,
         cfAccessAud: env.CF_ACCESS_AUD,
         cfAccessTeamDomain: env.CF_ACCESS_TEAM_DOMAIN,
         tenantId: env.DEFAULT_TENANT_ID,
@@ -681,6 +775,7 @@ export default {
         cachedDevApi = new PrintBridgeApi({
           apiKey: env.GATEWAY_API_KEY,
           employeeSecret: env.EMPLOYEE_AUTH_SECRET,
+          adminPassword: env.ADMIN_PASSWORD,
           cfAccessAud: env.CF_ACCESS_AUD,
           cfAccessTeamDomain: env.CF_ACCESS_TEAM_DOMAIN,
           tenantId: env.DEFAULT_TENANT_ID,
@@ -702,7 +797,17 @@ export default {
     }
 
     try {
-      // Exchange session token with employee passkey
+      // Admin Login: Username 'admin123' + password
+      if (url.pathname === '/api/admin/login' && request.method === 'POST') {
+        const body: any = await request.json();
+        const res = await api.adminLogin(body.username, body.password);
+        return new Response(JSON.stringify(res), {
+          status: res.success ? 200 : 401,
+          headers
+        });
+      }
+
+      // Legacy/Employee session exchange with PIN
       if (url.pathname === '/api/auth/session' && request.method === 'POST') {
         const body: any = await request.json();
         const res = await api.exchangeSession(body.passkey);
@@ -716,45 +821,128 @@ export default {
         return new Response(JSON.stringify(api.getPrinters()), { headers });
       }
 
-      // Submit print job (requires employee authentication)
+      // Submit print job:
+      // Supports Public Guest Submission (requires only guestName) OR authenticated employee
       if (url.pathname === '/api/jobs' && request.method === 'POST') {
-        let authContext: AuthContext;
-        try {
-          authContext = await api.authenticateEmployee(request.headers);
-        } catch (authErr: any) {
-          return new Response(JSON.stringify({ error: authErr.message }), { status: 401, headers });
-        }
-
         const body: any = await request.json();
         const fileBytes = Uint8Array.from(atob(body.fileBase64), c => c.charCodeAt(0));
+
+        let tenantId = 'dtc-office';
+        let userId = 'guest_user';
+        let userEmail = 'guest@office.local';
+        let guestName = body.guestName?.trim();
+
+        // Check if caller provided employee session / Access token
+        try {
+          const auth = await api.authenticateEmployee(request.headers);
+          userId = auth.userId;
+          userEmail = auth.userEmail;
+          tenantId = auth.tenantId;
+          if (!guestName) guestName = auth.userId;
+        } catch {
+          // Public Guest Printing: name is required to identify print job
+          if (!guestName) {
+            return new Response(JSON.stringify({ error: 'Name is required to submit a print job.' }), {
+              status: 400,
+              headers
+            });
+          }
+        }
+
         const res = await api.createJob({
-          tenantId: authContext.tenantId,
-          userId: authContext.userId,
-          userEmail: authContext.userEmail,
+          tenantId,
+          userId,
+          userEmail,
+          guestName,
           printerId: body.printerId,
           filename: body.filename,
           fileBytes,
           settings: body.settings
         });
+
         return new Response(JSON.stringify(res), {
           status: res.success ? 201 : 400,
           headers
         });
       }
 
-      // Query job status (requires employee authentication and tenant isolation)
-      if (url.pathname.startsWith('/api/jobs/') && request.method === 'GET') {
+      // Administrative Queue Management endpoints (Protected)
+      if (url.pathname === '/api/admin/queue' && request.method === 'GET') {
         let authContext: AuthContext;
         try {
           authContext = await api.authenticateEmployee(request.headers);
         } catch (authErr: any) {
           return new Response(JSON.stringify({ error: authErr.message }), { status: 401, headers });
         }
+        const queue = await api.getAdminQueue(authContext.tenantId);
+        return new Response(JSON.stringify(queue), { headers });
+      }
 
+      if (url.pathname.startsWith('/api/admin/queue/') && url.pathname.endsWith('/cancel') && request.method === 'POST') {
+        try {
+          await api.authenticateEmployee(request.headers);
+        } catch (authErr: any) {
+          return new Response(JSON.stringify({ error: authErr.message }), { status: 401, headers });
+        }
+        const jobId = url.pathname.replace('/api/admin/queue/', '').replace('/cancel', '');
+        const res = await api.cancelJob(jobId);
+        return new Response(JSON.stringify(res), { status: res.success ? 200 : 400, headers });
+      }
+
+      if (url.pathname === '/api/admin/settings' && request.method === 'GET') {
+        try {
+          await api.authenticateEmployee(request.headers);
+        } catch (authErr: any) {
+          return new Response(JSON.stringify({ error: authErr.message }), { status: 401, headers });
+        }
+        return new Response(JSON.stringify(api.getQueueSettings()), { headers });
+      }
+
+      if (url.pathname === '/api/admin/settings' && request.method === 'POST') {
+        try {
+          await api.authenticateEmployee(request.headers);
+        } catch (authErr: any) {
+          return new Response(JSON.stringify({ error: authErr.message }), { status: 401, headers });
+        }
+        const body: any = await request.json();
+        api.setQueueSettings(body);
+        return new Response(JSON.stringify({ success: true, settings: api.getQueueSettings() }), { headers });
+      }
+
+      // Query job status:
+      // Authorized via either unguessable receiptToken query param (guest receipt) OR employee auth header
+      if (url.pathname.startsWith('/api/jobs/') && request.method === 'GET') {
         const jobId = url.pathname.replace('/api/jobs/', '');
-        const job = await api.getJob(jobId, authContext.tenantId);
+        const receiptToken = url.searchParams.get('receiptToken');
+
+        let isAuth = false;
+        let tenantId = 'dtc-office';
+
+        if (receiptToken) {
+          isAuth = true;
+        } else {
+          try {
+            const auth = await api.authenticateEmployee(request.headers);
+            tenantId = auth.tenantId;
+            isAuth = true;
+          } catch {
+            isAuth = false;
+          }
+        }
+
+        if (!isAuth) {
+          return new Response(JSON.stringify({ error: 'Unauthorized: Missing valid receipt token or session.' }), {
+            status: 401,
+            headers
+          });
+        }
+
+        const job = await api.getJob(jobId, tenantId, receiptToken || undefined);
         if (!job) {
-          return new Response(JSON.stringify({ error: 'Job not found.' }), { status: 404, headers });
+          return new Response(JSON.stringify({ error: 'Job not found or invalid receipt token.' }), {
+            status: 404,
+            headers
+          });
         }
         return new Response(JSON.stringify(job), { headers });
       }

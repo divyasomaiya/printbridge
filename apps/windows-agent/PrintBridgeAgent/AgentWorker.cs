@@ -11,13 +11,15 @@ public class AgentWorker
     private readonly AgentConfig _config;
     private readonly FileSandbox _sandbox;
     private readonly IPrinterSpooler _spooler;
+    private readonly IDriverPrinter? _driverPrinter;
     private readonly HttpClient _httpClient;
 
-    public AgentWorker(AgentConfig config, IPrinterSpooler? spooler = null, HttpClient? httpClient = null)
+    public AgentWorker(AgentConfig config, IPrinterSpooler? spooler = null, HttpClient? httpClient = null, IDriverPrinter? driverPrinter = null)
     {
         _config = config;
         _sandbox = new FileSandbox(config.TempDirectory);
         _spooler = spooler ?? (config.MockPrinter ? new MockSpooler() : new WindowsSpooler());
+        _driverPrinter = driverPrinter ?? (config.MockPrinter ? (IDriverPrinter)_spooler : new WindowsDriverPrinter());
         _httpClient = httpClient ?? new HttpClient { BaseAddress = new Uri(config.ApiBaseUrl) };
         if (!string.IsNullOrEmpty(config.AgentKey))
         {
@@ -27,6 +29,7 @@ public class AgentWorker
 
     public FileSandbox Sandbox => _sandbox;
     public IPrinterSpooler Spooler => _spooler;
+    public IDriverPrinter? DriverPrinter => _driverPrinter;
 
     /// <summary>
     /// Executes a single polling and processing cycle.
@@ -42,9 +45,7 @@ public class AgentWorker
 
         try
         {
-            // CRITICAL DRY-RUN GUARD:
-            // Dry-run mode must NEVER poll or claim real office production print queues.
-            // It only claims from diagnostic mock queues.
+            // Dry-run mode exclusively targets diagnostic mock queues
             string[] supportedPrinters = _config.DryRun || _config.MockPrinter
                 ? new[] { "mock-printer-test" }
                 : new[] { "hp-laserjet-m1136", "mock-printer-test" };
@@ -158,44 +159,56 @@ public class AgentWorker
                     return true;
                 }
 
-                // CRITICAL HARDWARE & SPOOLER SAFETY CHECK:
-                // Blind RAW spooling of unrendered documents (PDF, Word, Excel, PowerPoint, Images,
-                // and ordinary unformatted plain text) directly to the HP LaserJet M1136 printer queue
-                // produces paper jams, garbage raw text, or driver crashes.
-                //
-                // RAW spooling is STRICTLY blocked unless the payload is pre-rendered PCL/PostScript
-                // or running in mock-printer mode for unit tests.
+                // DRIVER-LEVEL PRINTING VS RAW SPOOLING:
+                // RAW spooling is strictly confined to pre-rendered PCL/PRN files.
+                // All other documents (PDF, Word, Excel, PowerPoint, Images, and text)
+                // must be dispatched through the installed Windows printer driver.
                 bool isPreRenderedPcl = format == "pcl" || format == "prn";
 
-                if (!isPreRenderedPcl && !_config.MockPrinter)
+                if (isPreRenderedPcl)
                 {
-                    string renderLimitationNotice = $"FORMAT_NOT_RENDERED: Format '{format}' requires a configured rasterizer/engine (e.g. PDFium/Ghostscript/GDI PrintDocument) to produce PCL for the HP LaserJet M1136. Raw bytes cannot be safely spooled to physical printer.";
-                    Console.WriteLine($"[RENDER_CHECK] {renderLimitationNotice}");
-                    await UpdateStatusAsync(claimedJobId, leaseToken ?? "", "failed", renderLimitationNotice);
-                    return false;
+                    byte[] spoolPayload = await File.ReadAllBytesAsync(safeTargetFile);
+                    var spoolRes = _spooler.SubmitSpoolJob(targetPrinter, $"PrintBridge_{claimedJobId}_{filename}", spoolPayload, settings);
+                    if (spoolRes.Success)
+                    {
+                        Console.WriteLine($"Spooler acceptance confirmed: {spoolRes.Message}");
+                        await UpdateStatusAsync(claimedJobId, leaseToken ?? "", "completed", spoolRes.Message ?? "Job spooled to printer.");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Spooler rejection: {spoolRes.Message}");
+                        await UpdateStatusAsync(claimedJobId, leaseToken ?? "", "failed", spoolRes.Message ?? "Spooler rejected job.");
+                    }
+                    return spoolRes.Success;
                 }
 
-                byte[] spoolPayload = await File.ReadAllBytesAsync(safeTargetFile);
-
-                // Submit to Spooler
-                var spoolRes = _spooler.SubmitSpoolJob(targetPrinter, $"PrintBridge_{claimedJobId}_{filename}", spoolPayload, settings);
-
-                if (spoolRes.Success)
+                // Driver printing path (WindowsDriverPrinter on Windows OS)
+                if (_driverPrinter != null)
                 {
-                    Console.WriteLine($"Spooler acceptance confirmed: {spoolRes.Message}");
-                    await UpdateStatusAsync(claimedJobId, leaseToken ?? "", "completed", spoolRes.Message ?? "Job spooled to printer.");
-                }
-                else
-                {
-                    Console.WriteLine($"Spooler rejection: {spoolRes.Message}");
-                    await UpdateStatusAsync(claimedJobId, leaseToken ?? "", "failed", spoolRes.Message ?? "Spooler rejected job.");
+                    bool driverSuccess = _driverPrinter.PrintDocumentViaDriver(targetPrinter, $"PrintBridge_{claimedJobId}_{filename}", safeTargetFile, format, settings);
+                    if (driverSuccess)
+                    {
+                        string msg = $"Driver accepted document {filename} for printer {targetPrinter} (Copies={settings.Copies})";
+                        Console.WriteLine(msg);
+                        await UpdateStatusAsync(claimedJobId, leaseToken ?? "", "completed", msg);
+                        return true;
+                    }
+                    else
+                    {
+                        string err = $"Driver failed to print document {filename}";
+                        Console.WriteLine(err);
+                        await UpdateStatusAsync(claimedJobId, leaseToken ?? "", "failed", err);
+                        return false;
+                    }
                 }
 
-                return spoolRes.Success;
+                string unrenderedNotice = $"FORMAT_NOT_RENDERED: Format '{format}' requires driver rasterization (PDFium/GDI). Raw bytes blocked from HP LaserJet M1136.";
+                Console.WriteLine($"[RENDER_CHECK] {unrenderedNotice}");
+                await UpdateStatusAsync(claimedJobId, leaseToken ?? "", "failed", unrenderedNotice);
+                return false;
             }
             finally
             {
-                // CRITICAL DATA SAFETY: Secure cleanup of temporary working directory immediately after processing
                 _sandbox.SecureCleanup(workingDir);
                 Console.WriteLine($"[SECURITY] Working directory {workingDir} securely wiped.");
             }

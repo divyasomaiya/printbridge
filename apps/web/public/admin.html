@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Print Bridge — Admin Dashboard</title>
+  <style>
+    :root {
+      --primary: #1e40af;
+      --bg: #f8fafc;
+      --card-bg: #ffffff;
+      --border: #e2e8f0;
+      --text: #0f172a;
+      --text-muted: #64748b;
+      --danger: #b91c1c;
+      --success: #15803d;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, sans-serif; }
+    body { background: var(--bg); color: var(--text); padding: 20px; line-height: 1.5; }
+    .container { max-width: 900px; margin: 0 auto; }
+    .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+    h1 { font-size: 1.4rem; margin-bottom: 6px; }
+    h2 { font-size: 1.1rem; margin-bottom: 12px; }
+    .btn { padding: 8px 14px; border: none; border-radius: 6px; background: var(--primary); color: white; cursor: pointer; font-weight: 600; }
+    .btn:hover { opacity: 0.9; }
+    .btn-danger { background: var(--danger); font-size: 0.75rem; padding: 4px 8px; }
+    .btn-secondary { background: #64748b; }
+    input[type="text"], input[type="password"], input[type="number"] { width: 100%; padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 6px; margin-bottom: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; margin-top: 10px; }
+    th, td { text-align: left; padding: 10px; border-bottom: 1px solid var(--border); }
+    th { background: #f1f5f9; font-weight: 600; }
+    .badge { padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }
+    .badge-pending { background: #fef3c7; color: #92400e; }
+    .badge-claimed { background: #e0e7ff; color: #3730a3; }
+    .badge-completed { background: #dcfce7; color: #166534; }
+    .badge-failed { background: #fee2e2; color: #991b1b; }
+    .badge-cancelled { background: #f1f5f9; color: #475569; }
+    .controls { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+      <div>
+        <h1>Print Bridge Administrator</h1>
+        <p style="font-size: 0.875rem; color: var(--text-muted);">Office print queue monitor & controls</p>
+      </div>
+      <div>
+        <a href="/" style="font-size: 0.875rem; color: var(--primary); text-decoration: none;">&larr; Guest Printing Page</a>
+      </div>
+    </div>
+
+    <!-- Login Card -->
+    <div id="loginCard" class="card">
+      <h2>Administrator Login</h2>
+      <div style="max-width: 360px;">
+        <label style="font-size: 0.8125rem; font-weight: 600;">Username</label>
+        <input type="text" id="adminUser" value="admin123" readonly style="background: #f1f5f9;">
+        <label style="font-size: 0.8125rem; font-weight: 600;">Password</label>
+        <input type="password" id="adminPass" placeholder="Enter administrator password">
+        <button id="loginBtn" class="btn">Sign In</button>
+      </div>
+    </div>
+
+    <!-- Dashboard Content -->
+    <div id="dashboardCard" class="card" style="display: none;">
+      <div class="controls">
+        <button id="refreshBtn" class="btn btn-secondary">Refresh Queue</button>
+        <button id="pauseToggleBtn" class="btn">Pause Queue</button>
+        <span id="queueStatusBadge" class="badge badge-completed">Queue Active</span>
+        <button id="logoutBtn" style="margin-left: auto; background: none; border: none; color: var(--text-muted); cursor: pointer;">Sign Out</button>
+      </div>
+
+      <h2>Live Print Queue</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Guest / User</th>
+            <th>Document</th>
+            <th>Format</th>
+            <th>Status</th>
+            <th>Details</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="queueTableBody">
+          <tr><td colspan="7" style="text-align: center; color: var(--text-muted);">Loading queue...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script src="/admin.js"></script>
+</body>
+</html>

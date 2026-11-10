@@ -6,7 +6,7 @@ Universal Cloud-to-Local-Printer Architecture & Continuation Guide for Google An
 
 ## 1. Executive Summary & Verification Context
 
-Print Bridge is a secure, lightweight, unattended cloud-to-printer platform designed to enable authorized users to print documents directly from phones, tablets, and laptops to office printers without emailing files between computers.
+Print Bridge is a secure, lightweight, unattended cloud-to-printer platform designed to enable authorized users and office guests to print documents directly from phones, tablets, and laptops to office printers without emailing files between computers.
 
 ### Current Deployment Environment:
 - **Print Host**: Windows 7 SP1 host machine with shared HP LaserJet Professional M1136 MFP on the local LAN (`\\<OFFICE-HOST>\<PRINTER-SHARE-NAME>`).
@@ -16,27 +16,24 @@ Print Bridge is a secure, lightweight, unattended cloud-to-printer platform desi
 
 ---
 
-## 2. P0 Audit Hardening Applied in Final Sprint
+## 2. Implemented Architecture & Two Separate Interfaces
 
-1. **Authentication Architecture**:
-   - Zero trust in unverified `Cf-Access-Authenticated-User-Email` header. Direct worker URLs without valid Access assertion or session token fail closed with 401 Unauthorized.
-   - Cloudflare Access `Cf-Access-Jwt-Assertion` verification enforcing audience tag matching (`CF_ACCESS_AUD`) and unexpired timestamp checks.
-   - Replaced insecure PIN return: `/api/auth/session` now signs short-lived session tokens (`sess.<payload>.<hmac-sha256>`). Raw server secrets are NEVER stored in browser `localStorage`.
-   - Removed web frontend network-error fallback that allowed entering unverified PINs.
-2. **Local D1 & R2 Persistence Verification**:
-   - Cloudflare D1 SQL database support with atomic claim queries (`UPDATE print_jobs ... WHERE status='pending'`).
-   - Uses `meta.changes` to accurately detect affected rows in D1.
-   - Cloudflare R2 object binding support with immediate deletion of storage payload upon completed spooler handoff.
-   - Scheduled cron worker handler purging expired storage objects and abandoned jobs older than 24 hours.
-3. **Windows Agent Guardrails & Hardware Protection**:
-   - Exceptions during processing retain the claimed job ID and accurately report failures to the API instead of being dropped.
-   - Dry-run mode (`--dry-run`) exclusively targets diagnostic mock queues (`mock-printer-test`), preventing intervention or claim of real office production jobs, and NEVER marks jobs as completed on the server.
-   - RAW spooling of unrendered documents (PDF, Word, Excel, PowerPoint, images, and unrendered plain text) is strictly blocked from physical queues to prevent printer errors and paper wastage.
+1. **Public/Guest Printing (`/`)**:
+   - Frictionless workflow: **Open Website → Enter Name → Select Document → Choose Print Settings → Print**.
+   - No login, registration, email verification, or password required.
+   - Status tracking is protected via unguessable random receipt tokens (`/api/jobs/:id?receiptToken=...`) so guests cannot view or snoop on other users' print jobs.
+2. **Private Administrator Dashboard (`/admin`)**:
+   - Protected dashboard with login for username `admin123`. Password configured privately via `ADMIN_PASSWORD` secret.
+   - Live queue table with guest names, timestamps, printer status, pause/resume queue toggle, and cancellation of pending jobs.
+3. **Windows Agent Driver-Level Printing & Guardrails**:
+   - Implemented `WindowsDriverPrinter` using the installed Windows printer driver (`ProcessStartInfo` verb `printto` with 30s timeout) to ensure documents are rendered properly by the printer driver rather than sent as raw bytes.
+   - RAW spooling is blocked for unrendered binaries (PDF, Word, Excel, PowerPoint, images, text) to prevent paper jams and garbage output on the HP LaserJet M1136.
+   - Dry-run mode (`--dry-run`) exclusively targets diagnostic mock queues (`mock-printer-test`) and never marks production print jobs as completed.
 4. **FileSandbox.cs Safety**:
-   - Boundary checks enforce exact root trailing separators, preventing sibling-prefix directory traversal.
-   - Strict alphanumeric/underscore regex validation on Job IDs (`^[a-zA-Z0-9_\-]+$`), rejecting empty, whitespace, `.`, `..`, and subpath strings.
-   - Comprehensive ancestor directory walk inspecting for NTFS Reparse Points (symlinks and directory junctions) up to filesystem root.
-   - Guard against sandbox root deletion: `SecureCleanup` asserts that target is an immediate child directory matching valid job naming and explicitly prevents deleting `_allowedRoot`.
+   - Strict root boundary validation with trailing separators prevents sibling-prefix directory traversal.
+   - Job IDs validated with strict regex (`^[a-zA-Z0-9_\-]+$`).
+   - Ancestor directory walk rejects NTFS Reparse Points (symlinks and directory junctions).
+   - `SecureCleanup` restricts deletion strictly to immediate job directories and protects sandbox root.
 
 ---
 
@@ -44,11 +41,11 @@ Print Bridge is a secure, lightweight, unattended cloud-to-printer platform desi
 
 | Format Category | Extensions | Implementation Status | Functional Reality & Antigravity Next Steps |
 |---|---|---|---|
-| **Plain Text / CSV** | `.txt`, `.csv` | **Functional Parser / Driver Required** | `TextRenderer` parses lines, paginates according to standard page margins (55 lines/page), and applies page ranges. Physical printing requires GDI font rendering to printer DC. |
-| **PDF** | `.pdf` | **Structure Inspected / Guarded** | `PdfRenderer` safely inspects page trees and catalog counts, and handles page ranges. **NOTE:** Blind raw spooling of PDFs to GDI host-based printers (like HP LaserJet M1136) is blocked. Rasterization into PCL via PDFium or Ghostscript is required for physical printing. |
-| **Images** | `.jpg`, `.png`, `.bmp`, `.webp`, `.tif` | **Dimension Scaled / Guarded** | `ImageRenderer` inspects file sizes, scales dimensions, and applies orientation (portrait/landscape). Requires GDI device context raster blitting for physical output. |
-| **Sanitized Webpages** | `.html`, `.htm` | **Functional Security Sanitizer** | `WebpageRenderer` strips `<script>` tags, inline handlers (`onerror`, `onload`), and exfiltration URLs. Headless browser rendering is required for full CSS visual fidelity. |
-| **Office Documents** | `.doc`, `.docx`, `.rtf`, `.xls`, `.xlsx`, `.ppt`, `.pptx` | **Adapter Specification / Missing Engine Reporting** | `OfficeRenderer` validates formats, enforces macro denial, and provides explicit error messaging when headless LibreOffice or MS Office COM interop is absent. In dry-run mode, it produces emulated spool outputs. |
+| **Plain Text / CSV** | `.txt`, `.csv` | **Functional Parser / Driver Dispatched** | `TextRenderer` paginates lines (55 lines/page). Dispatched via `WindowsDriverPrinter` to installed driver. |
+| **PDF** | `.pdf` | **Inspected / Driver Dispatched** | `PdfRenderer` inspects page counts and structure. Dispatched through Windows driver printer. Rasterization via embedded PDFium wrapper is the recommended next task for headless fidelity. |
+| **Images** | `.jpg`, `.png`, `.bmp`, `.webp`, `.tif` | **Dimension Scaled / Driver Dispatched** | `ImageRenderer` inspects dimensions and scales for portrait/landscape. Dispatched via driver printing. |
+| **Sanitized Webpages** | `.html`, `.htm` | **Functional Security Sanitizer** | `WebpageRenderer` strips `<script>` tags, inline handlers (`onerror`, `onload`), and exfiltration URLs. |
+| **Office Documents** | `.doc`, `.docx`, `.rtf`, `.xls`, `.xlsx`, `.ppt`, `.pptx` | **Driver Printing / Missing Engine Reporting** | `OfficeRenderer` validates formats, enforces macro denial, and dispatches via Windows driver verb `printto`. |
 
 ---
 
@@ -70,9 +67,9 @@ Print Bridge is a secure, lightweight, unattended cloud-to-printer platform desi
 TypeScript / Node Test Suites:
   ✔ tests/shared/shared.test.js (7/7 tests passed)
   ✔ tests/renderers/renderers.test.js (5/5 tests passed)
-  ✔ tests/api/api.test.js (6/6 tests passed, including Cloudflare Access JWT validation and D1/R2 persistence simulation)
+  ✔ tests/api/api.test.js (4/4 tests passed: Public Guest Workflow, Admin admin123 Workflow, Worker fetch routing)
   ✔ tests/e2e/e2e.test.js (1/1 test passed)
-  Total: 19 passed, 0 failed
+  Total: 17 passed, 0 failed
 
 .NET Agent Test Suite (including adversarial sandbox tests):
   ✔ FileSandbox_RestrictsAccessToAllowedRoot

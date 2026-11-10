@@ -52,9 +52,9 @@ export interface PrintSettings {
 export interface PrinterCapability {
   id: string;
   name: string;
-  host: string; // e.g. "SILVERTOUCH-PC" or local gateway
-  shareName: string; // e.g. "HP LaserJet Professional M1136 MFP"
-  fullUncPath: string; // e.g. "\\SILVERTOUCH-PC\HP LaserJet Professional M1136 MFP"
+  host: string;
+  shareName: string;
+  fullUncPath: string;
   isOnline: boolean;
   supportsColor: boolean;
   supportsAutoDuplex: boolean;
@@ -64,11 +64,19 @@ export interface PrinterCapability {
   description: string;
 }
 
+export interface SystemSettings {
+  queuePaused: boolean;
+  maxCopiesLimit: number;
+  maxFileSizeMb: number;
+  allowedTenants: string[];
+}
+
 export interface PrintJob {
   id: string;
   tenantId: string;
   userId: string;
   userEmail: string;
+  employeeName?: string;
   printerId: string;
   printerName: string;
   originalFileName: string;
