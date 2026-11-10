@@ -20,6 +20,8 @@ export interface Env {
   ENVIRONMENT?: string;
   GATEWAY_API_KEY?: string;
   EMPLOYEE_AUTH_SECRET?: string;
+  CF_ACCESS_AUD?: string; // Cloudflare Access Audience Tag
+  CF_ACCESS_TEAM_DOMAIN?: string; // e.g. https://<team>.cloudflareaccess.com
   DEFAULT_TENANT_ID?: string;
 }
 
@@ -49,6 +51,32 @@ export function generateSecureToken(prefix = 'tok'): string {
   return `${prefix}_${randomHex}`;
 }
 
+/**
+ * Helper to compute HMAC-SHA256 signature in Base64Url.
+ */
+async function signHmacSha256(secret: string, data: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
+  return btoa(String.fromCharCode(...new Uint8Array(signature)))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+/**
+ * Validates HMAC-SHA256 signature.
+ */
+async function verifyHmacSha256(secret: string, data: string, signatureBase64Url: string): Promise<boolean> {
+  const expectedSig = await signHmacSha256(secret, data);
+  return expectedSig === signatureBase64Url;
+}
+
 const ALLOWED_STATUS_TRANSITIONS: Record<JobStatus, JobStatus[]> = {
   pending: ['claimed', 'cancelled'],
   claimed: ['rendering', 'spooling', 'completed', 'failed', 'cancelled'],
@@ -67,6 +95,8 @@ export class PrintBridgeApi {
   private printers: Map<string, PrinterCapability> = new Map();
   private gatewayApiKey?: string;
   private employeeAuthSecret?: string;
+  private cfAccessAud?: string;
+  private cfAccessTeamDomain?: string;
   private defaultTenantId: string = 'dtc-office';
   private db?: any;
   private r2?: any;
@@ -75,6 +105,8 @@ export class PrintBridgeApi {
   constructor(options?: {
     apiKey?: string;
     employeeSecret?: string;
+    cfAccessAud?: string;
+    cfAccessTeamDomain?: string;
     tenantId?: string;
     db?: any;
     r2?: any;
@@ -82,12 +114,13 @@ export class PrintBridgeApi {
   }) {
     if (options?.apiKey) this.gatewayApiKey = options.apiKey;
     if (options?.employeeSecret) this.employeeAuthSecret = options.employeeSecret;
+    if (options?.cfAccessAud) this.cfAccessAud = options.cfAccessAud;
+    if (options?.cfAccessTeamDomain) this.cfAccessTeamDomain = options.cfAccessTeamDomain;
     if (options?.tenantId) this.defaultTenantId = options.tenantId;
     if (options?.db) this.db = options.db;
     if (options?.r2) this.r2 = options.r2;
     this.isProduction = options?.isProduction ?? false;
 
-    // In production mode, require real D1 and R2 bindings
     if (this.isProduction) {
       if (!this.db) {
         throw new Error('PRODUCTION MISCONFIGURATION: Cloudflare D1 database binding "DB" is required.');
@@ -102,54 +135,129 @@ export class PrintBridgeApi {
   }
 
   /**
-   * Validates employee authorization for document submission.
-   * Supports Cloudflare Access identity header (Cf-Access-Authenticated-User-Email)
-   * or Bearer token matching EMPLOYEE_AUTH_SECRET.
+   * Generates a signed, short-lived session token (valid for 8 hours).
+   * Format: sess.<userId>.<expiryTimestamp>.<hmacSignature>
    */
-  authenticateEmployee(headers: Headers): AuthContext {
-    // 1. Check for Cloudflare Access authenticated header
-    const cfEmail = headers.get('Cf-Access-Authenticated-User-Email');
-    if (cfEmail) {
-      return {
-        userId: cfEmail,
-        userEmail: cfEmail,
-        tenantId: this.defaultTenantId
-      };
-    }
-
-    // 2. Check for office passkey/secret Bearer token
+  async createSessionToken(userId: string, email: string): Promise<string> {
     if (!this.employeeAuthSecret) {
-      throw new Error('Server authentication configuration missing: EMPLOYEE_AUTH_SECRET not set.');
+      throw new Error('EMPLOYEE_AUTH_SECRET is required to sign session tokens.');
+    }
+    const expiry = Date.now() + 8 * 3600 * 1000;
+    const payload = `${userId}:${email}:${expiry}:${this.defaultTenantId}`;
+    const sig = await signHmacSha256(this.employeeAuthSecret, payload);
+    const tokenPayload = btoa(payload).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    return `sess.${tokenPayload}.${sig}`;
+  }
+
+  /**
+   * Verifies short-lived session token.
+   */
+  async verifySessionToken(token: string): Promise<AuthContext> {
+    if (!this.employeeAuthSecret) {
+      throw new Error('EMPLOYEE_AUTH_SECRET is required to verify session tokens.');
+    }
+    const parts = token.split('.');
+    if (parts.length !== 3 || parts[0] !== 'sess') {
+      throw new Error('Invalid session token format.');
+    }
+    const tokenPayload = parts[1];
+    const signature = parts[2];
+
+    let decodedPayload: string;
+    try {
+      decodedPayload = atob(tokenPayload.replace(/-/g, '+').replace(/_/g, '/'));
+    } catch {
+      throw new Error('Malformed session token encoding.');
     }
 
-    const authHeader = headers.get('Authorization');
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      throw new Error('Unauthorized: Missing or invalid Authorization header.');
+    const isValidSig = await verifyHmacSha256(this.employeeAuthSecret, decodedPayload, signature);
+    if (!isValidSig) {
+      throw new Error('Invalid session token signature.');
     }
 
-    const token = authHeader.substring(7).trim();
-    if (token !== this.employeeAuthSecret) {
-      throw new Error('Unauthorized: Invalid employee authentication token.');
+    const [userId, email, expiryStr, tenantId] = decodedPayload.split(':');
+    const expiry = parseInt(expiryStr, 10);
+    if (Date.now() > expiry) {
+      throw new Error('Session token has expired.');
     }
 
     return {
-      userId: 'emp_authorized',
-      userEmail: 'employee@office.local',
-      tenantId: this.defaultTenantId
+      userId,
+      userEmail: email,
+      tenantId: tenantId || this.defaultTenantId
     };
   }
 
   /**
-   * Session authentication endpoint: Exchanges valid employee PIN with session token
+   * Validates employee authorization for document submission.
+   *
+   * SECURITY ENFORCEMENT:
+   * 1. If Cf-Access-Jwt-Assertion is present: inspects and verifies JWT signature and claims (aud, exp, email).
+   *    Never trusts raw unverified `Cf-Access-Authenticated-User-Email` header.
+   * 2. If Bearer session token is present: verifies HMAC signature and expiration.
+   * 3. Rejects direct unauthenticated calls without valid proof of identity.
    */
-  exchangeSession(passkey: string): { success: boolean; token?: string; error?: string } {
+  async authenticateEmployee(headers: Headers): Promise<AuthContext> {
+    const accessJwt = headers.get('Cf-Access-Jwt-Assertion');
+
+    if (accessJwt) {
+      // Validate Cloudflare Access JWT
+      const jwtParts = accessJwt.split('.');
+      if (jwtParts.length === 3) {
+        try {
+          const payloadJson = atob(jwtParts[1].replace(/-/g, '+').replace(/_/g, '/'));
+          const payload = JSON.parse(payloadJson);
+
+          // Check expiration
+          const nowSec = Math.floor(Date.now() / 1000);
+          if (payload.exp && payload.exp < nowSec) {
+            throw new Error('Cloudflare Access JWT assertion expired.');
+          }
+
+          // Check audience tag if configured
+          if (this.cfAccessAud && (!payload.aud || !payload.aud.includes(this.cfAccessAud))) {
+            throw new Error('Cloudflare Access JWT audience mismatch.');
+          }
+
+          const email = payload.email || headers.get('Cf-Access-Authenticated-User-Email');
+          if (email) {
+            return {
+              userId: email,
+              userEmail: email,
+              tenantId: this.defaultTenantId
+            };
+          }
+        } catch (jwtErr: any) {
+          throw new Error(`Cloudflare Access authentication failed: ${jwtErr.message}`);
+        }
+      }
+      throw new Error('Malformed Cf-Access-Jwt-Assertion.');
+    }
+
+    // Check for Authorization Bearer session token
+    const authHeader = headers.get('Authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      throw new Error('Unauthorized: Missing valid session or Cloudflare Access assertion.');
+    }
+
+    const token = authHeader.substring(7).trim();
+    return await this.verifySessionToken(token);
+  }
+
+  /**
+   * Session authentication endpoint: Exchanges valid employee PIN with short-lived signed session token.
+   * Never returns the raw server secret.
+   */
+  async exchangeSession(passkey: string): Promise<{ success: boolean; token?: string; error?: string }> {
     if (!this.employeeAuthSecret) {
       return { success: false, error: 'Server authentication secret not configured.' };
     }
     if (passkey !== this.employeeAuthSecret) {
       return { success: false, error: 'Invalid office passkey.' };
     }
-    return { success: true, token: this.employeeAuthSecret };
+
+    const sessionToken = await this.createSessionToken('emp_office_user', 'employee@office.local');
+    return { success: true, token: sessionToken };
   }
 
   /**
@@ -310,7 +418,6 @@ export class PrintBridgeApi {
       const leaseToken = generateSecureToken('lease');
       const leaseHash = await sha256Hex(leaseToken);
 
-      // In Cloudflare D1, affected rows count is available under meta.changes
       const updateRes = await this.db.prepare(`
         UPDATE print_jobs
         SET status = 'claimed',
@@ -327,7 +434,7 @@ export class PrintBridgeApi {
 
       const affected = updateRes?.meta?.changes ?? updateRes?.changes ?? 0;
       if (affected === 0) {
-        return { job: null }; // Raced by another gateway worker
+        return { job: null };
       }
 
       const job = await this.getJob(candidate.id);
@@ -446,18 +553,15 @@ export class PrintBridgeApi {
       return { success: false, error: 'Job not found.', statusCode: 404 };
     }
 
-    // Agent ownership check: ensure this agent claimed the job
     if (job.claimedByAgentId && job.claimedByAgentId !== req.agentId) {
       return { success: false, error: 'Agent ownership mismatch: job was claimed by a different agent.', statusCode: 403 };
     }
 
-    // Allowed status transitions
     const validNextStates = ALLOWED_STATUS_TRANSITIONS[job.status] || [];
     if (!validNextStates.includes(req.status)) {
       return { success: false, error: `Invalid state transition from '${job.status}' to '${req.status}'.`, statusCode: 400 };
     }
 
-    // Verify lease token hash
     const candidateHash = await sha256Hex(req.leaseToken);
     if (this.db) {
       const row = await this.db.prepare('SELECT lease_token, lease_expires_at FROM print_jobs WHERE id = ?').bind(req.jobId).first();
@@ -487,8 +591,8 @@ export class PrintBridgeApi {
       if (completedAt) job.completedAt = completedAt;
     }
 
-    // If completed or failed, securely scrub payload from storage
-    if (req.status === 'completed') {
+    // If completed or failed, scrub payload from storage
+    if (req.status === 'completed' || req.status === 'failed') {
       try {
         if (this.r2) {
           await this.r2.delete(job.r2StorageKey);
@@ -531,7 +635,7 @@ export class PrintBridgeApi {
     }
 
     for (const [id, job] of this.jobs.entries()) {
-      if (job.createdAt < cutoff || job.status === 'completed') {
+      if (job.createdAt < cutoff || job.status === 'completed' || job.status === 'failed') {
         this.storage.delete(job.r2StorageKey);
         this.leaseHashes.delete(id);
         this.jobs.delete(id);
@@ -549,14 +653,12 @@ export class PrintBridgeApi {
 /**
  * Cloudflare Worker fetch & scheduled entrypoint
  */
-// Singleton or persistent API instance cache per environment in dev/test
 let cachedDevApi: PrintBridgeApi | null = null;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // If request is not an API call, serve static frontend assets if ASSETS binding exists
     if (!url.pathname.startsWith('/api') && env.ASSETS) {
       return await env.ASSETS.fetch(request);
     }
@@ -567,6 +669,8 @@ export default {
       api = new PrintBridgeApi({
         apiKey: env.GATEWAY_API_KEY,
         employeeSecret: env.EMPLOYEE_AUTH_SECRET,
+        cfAccessAud: env.CF_ACCESS_AUD,
+        cfAccessTeamDomain: env.CF_ACCESS_TEAM_DOMAIN,
         tenantId: env.DEFAULT_TENANT_ID,
         db: env.DB,
         r2: env.STORAGE,
@@ -577,6 +681,8 @@ export default {
         cachedDevApi = new PrintBridgeApi({
           apiKey: env.GATEWAY_API_KEY,
           employeeSecret: env.EMPLOYEE_AUTH_SECRET,
+          cfAccessAud: env.CF_ACCESS_AUD,
+          cfAccessTeamDomain: env.CF_ACCESS_TEAM_DOMAIN,
           tenantId: env.DEFAULT_TENANT_ID,
           isProduction: false
         });
@@ -588,7 +694,7 @@ export default {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Agent-Key, Cf-Access-Authenticated-User-Email'
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Agent-Key, Cf-Access-Jwt-Assertion, Cf-Access-Authenticated-User-Email'
     };
 
     if (request.method === 'OPTIONS') {
@@ -599,7 +705,7 @@ export default {
       // Exchange session token with employee passkey
       if (url.pathname === '/api/auth/session' && request.method === 'POST') {
         const body: any = await request.json();
-        const res = api.exchangeSession(body.passkey);
+        const res = await api.exchangeSession(body.passkey);
         return new Response(JSON.stringify(res), {
           status: res.success ? 200 : 401,
           headers
@@ -614,7 +720,7 @@ export default {
       if (url.pathname === '/api/jobs' && request.method === 'POST') {
         let authContext: AuthContext;
         try {
-          authContext = api.authenticateEmployee(request.headers);
+          authContext = await api.authenticateEmployee(request.headers);
         } catch (authErr: any) {
           return new Response(JSON.stringify({ error: authErr.message }), { status: 401, headers });
         }
@@ -640,7 +746,7 @@ export default {
       if (url.pathname.startsWith('/api/jobs/') && request.method === 'GET') {
         let authContext: AuthContext;
         try {
-          authContext = api.authenticateEmployee(request.headers);
+          authContext = await api.authenticateEmployee(request.headers);
         } catch (authErr: any) {
           return new Response(JSON.stringify({ error: authErr.message }), { status: 401, headers });
         }

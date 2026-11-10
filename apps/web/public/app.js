@@ -28,14 +28,14 @@ document.addEventListener('DOMContentLoaded', () => {
     const saveAuthBtn = document.getElementById('saveAuthBtn');
     const cancelAuthBtn = document.getElementById('cancelAuthBtn');
     let selectedFile = null;
-    // Manage employee passkey/token in localStorage (never hardcoded in source)
-    function getStoredToken() {
-        return localStorage.getItem('pb_employee_token');
+    // Manage employee session token in localStorage. Raw PINs/secrets are NEVER stored.
+    function getStoredSessionToken() {
+        return localStorage.getItem('pb_session_token');
     }
     function updateAuthUI() {
-        const token = getStoredToken();
+        const token = getStoredSessionToken();
         if (token) {
-            authStatusText.textContent = 'Device Authorized (Office Access)';
+            authStatusText.textContent = 'Device Authorized (Active Office Session)';
             authStatusText.style.color = '#15803d';
             authBtn.textContent = 'Change PIN';
         }
@@ -53,33 +53,30 @@ document.addEventListener('DOMContentLoaded', () => {
         authDialog.style.display = 'none';
     });
     saveAuthBtn.addEventListener('click', async () => {
-        const val = employeePasskeyInput.value.trim();
-        if (!val)
+        const passkey = employeePasskeyInput.value.trim();
+        if (!passkey)
             return;
         try {
-            // Exchange PIN/passkey with backend to obtain a verified session token
+            // Exchange PIN with backend to receive signed short-lived session token
             const res = await fetch('/api/auth/session', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ passkey: val })
+                body: JSON.stringify({ passkey })
             });
             const data = await res.json();
             if (res.ok && data.token) {
-                localStorage.setItem('pb_employee_token', data.token);
+                localStorage.setItem('pb_session_token', data.token);
                 authDialog.style.display = 'none';
                 employeePasskeyInput.value = '';
                 updateAuthUI();
             }
             else {
-                alert(data.error || 'Authorization failed: Invalid office PIN');
+                alert(data.error || 'Authorization failed: Invalid office PIN.');
             }
         }
         catch {
-            // Offline / fallback direct token assignment for local testing
-            localStorage.setItem('pb_employee_token', val);
-            authDialog.style.display = 'none';
-            employeePasskeyInput.value = '';
-            updateAuthUI();
+            // SECURITY FIX: Never accept unverified PINs as fallback on network error
+            alert('Network error: Unable to contact authentication server to verify credentials.');
         }
     });
     updateAuthUI();
@@ -147,11 +144,12 @@ document.addEventListener('DOMContentLoaded', () => {
     submitJobBtn.addEventListener('click', async () => {
         if (!selectedFile)
             return;
-        const token = getStoredToken();
-        if (!token) {
-            authDialog.style.display = 'block';
-            employeePasskeyInput.focus();
-            return;
+        const sessionToken = getStoredSessionToken();
+        const headers = {
+            'Content-Type': 'application/json'
+        };
+        if (sessionToken) {
+            headers['Authorization'] = `Bearer ${sessionToken}`;
         }
         submitJobBtn.disabled = true;
         statusSection.style.display = 'block';
@@ -179,10 +177,7 @@ document.addEventListener('DOMContentLoaded', () => {
             try {
                 const response = await fetch('/api/jobs', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${token}`
-                    },
+                    headers,
                     body: JSON.stringify(payload)
                 });
                 const resData = await response.json();
@@ -192,9 +187,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     // Track job status periodically
                     const pollInterval = setInterval(async () => {
                         try {
-                            const stRes = await fetch(`/api/jobs/${resData.job.id}`, {
-                                headers: { 'Authorization': `Bearer ${token}` }
-                            });
+                            const stRes = await fetch(`/api/jobs/${resData.job.id}`, { headers });
                             if (stRes.ok) {
                                 const jobStatus = await stRes.json();
                                 statusText.textContent = `Status: ${jobStatus.status.toUpperCase()}`;
@@ -210,6 +203,11 @@ document.addEventListener('DOMContentLoaded', () => {
                     }, 3000);
                 }
                 else {
+                    if (response.status === 401) {
+                        localStorage.removeItem('pb_session_token');
+                        updateAuthUI();
+                        authDialog.style.display = 'block';
+                    }
                     statusText.textContent = 'Submission Rejected';
                     statusDetails.textContent = resData.error || 'Unknown error occurred.';
                 }

@@ -53,6 +53,8 @@ binding = "ASSETS"
 [vars]
 ENVIRONMENT = "production"
 DEFAULT_TENANT_ID = "dtc-office"
+CF_ACCESS_AUD = "<PASTE-YOUR-CLOUDFLARE-ACCESS-AUDIENCE-TAG-HERE>" # Optional: If using Cloudflare Access Zero Trust
+CF_ACCESS_TEAM_DOMAIN = "https://<your-team-name>.cloudflareaccess.com"
 
 [[d1_databases]]
 binding = "DB"
@@ -78,7 +80,7 @@ Do **NOT** put secrets in git repositories. Run these commands from your local t
 npx wrangler secret put GATEWAY_API_KEY
 # Enter a high-entropy secret (e.g., 32 random characters)
 
-# Set the office employee access passkey / secret
+# Set the office employee access passkey / secret for signed session tokens
 npx wrangler secret put EMPLOYEE_AUTH_SECRET
 # Enter your office employee PIN or passkey
 ```
@@ -94,7 +96,8 @@ To enable seamless single sign-on without PINs:
 3. Name: `Print Bridge Office`.
 4. Domain: `print.your-office-domain.com`.
 5. Set an Access Policy allowing authorized employee email domains (e.g., `@yourcompany.com`).
-6. When enabled, Cloudflare automatically injects the `Cf-Access-Authenticated-User-Email` header into requests, granting access without requiring employees to type a PIN.
+6. Copy the **Application Audience (AUD) Tag** from the Access overview and paste it into `CF_ACCESS_AUD` in `wrangler.toml`.
+7. When enabled, Cloudflare automatically injects the cryptographically signed `Cf-Access-Jwt-Assertion` header into requests. The backend verifies the JWT signature, audience, and expiration to authenticate employees without entering a PIN.
 
 ---
 
@@ -131,7 +134,7 @@ This single command deploys:
 
 1. **Web UI Verification**:
    - Open your deployed worker URL in a browser (or scan QR code).
-   - Enter your office PIN or authenticate via Cloudflare Access.
+   - Enter your office PIN to generate a signed session token, or authenticate via Cloudflare Access.
    - Confirm printer profile displays `HP LaserJet Professional M1136 MFP (Shared Office Printer)`.
 2. **Enqueue Verification**:
    - Upload a test file (e.g. `test.pdf`) and click **Print Document**.

@@ -30,9 +30,13 @@ test('End-to-End Workflow: Upload -> API Queue -> Lease Claim -> Render -> Spool
       collate: true
     };
 
+    const sessRes = await api.exchangeSession(employeeSecret);
+    assert.equal(sessRes.success, true);
+    assert.ok(sessRes.token);
+
     const headers = new Headers();
-    headers.set('Authorization', `Bearer ${employeeSecret}`);
-    const auth = api.authenticateEmployee(headers);
+    headers.set('Authorization', `Bearer ${sessRes.token}`);
+    const auth = await api.authenticateEmployee(headers);
     assert.equal(auth.tenantId, 'dtc-office');
 
     const createRes = await api.createJob({

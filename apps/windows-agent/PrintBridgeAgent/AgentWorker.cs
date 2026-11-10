@@ -36,17 +36,24 @@ public class AgentWorker
     {
         Console.WriteLine($"[{DateTime.UtcNow:s}] Polling for jobs from {_config.ApiBaseUrl}...");
 
-        PrintJob? job = null;
+        string? claimedJobId = null;
         string? leaseToken = null;
         string? downloadUrl = null;
 
         try
         {
+            // CRITICAL DRY-RUN GUARD:
+            // Dry-run mode must NEVER poll or claim real office production print queues.
+            // It only claims from diagnostic mock queues.
+            string[] supportedPrinters = _config.DryRun || _config.MockPrinter
+                ? new[] { "mock-printer-test" }
+                : new[] { "hp-laserjet-m1136", "mock-printer-test" };
+
             var claimRequest = new
             {
                 agentId = _config.AgentId,
                 agentVersion = "1.0.0",
-                supportedPrinters = new[] { "hp-laserjet-m1136", "mock-printer-test" },
+                supportedPrinters,
                 leaseDurationSeconds = 120
             };
 
@@ -69,8 +76,8 @@ public class AgentWorker
                 return false;
             }
 
-            // Extract job info
-            var jobId = jobElem.GetProperty("id").GetString()!;
+            // Retain job identifiers across the entire execution scope
+            claimedJobId = jobElem.GetProperty("id").GetString()!;
             var filename = jobElem.GetProperty("originalFileName").GetString()!;
             var format = jobElem.GetProperty("fileFormat").GetString()!;
             var printerId = jobElem.GetProperty("printerId").GetString()!;
@@ -84,10 +91,10 @@ public class AgentWorker
                 downloadUrl = dlElem.GetString();
             }
 
-            Console.WriteLine($"Claimed Job {jobId} ({filename}, format: {format}) for printer {printerId}");
+            Console.WriteLine($"Claimed Job {claimedJobId} ({filename}, format: {format}) for printer {printerId}");
 
             // Process job within safe sandbox
-            var workingDir = _sandbox.CreateJobWorkingDir(jobId);
+            var workingDir = _sandbox.CreateJobWorkingDir(claimedJobId);
             try
             {
                 var safeTargetFile = _sandbox.ResolveSafeFilePath(workingDir, filename);
@@ -95,10 +102,9 @@ public class AgentWorker
                 // Download document safely
                 if (string.IsNullOrEmpty(downloadUrl))
                 {
-                    // Fail closed if downloadUrl is missing: NEVER substitute fake bytes in production
                     string dlError = "CRITICAL: API provided no download URL for claimed job.";
                     Console.WriteLine($"[ERROR] {dlError}");
-                    await UpdateStatusAsync(jobId, leaseToken ?? "", "failed", dlError);
+                    await UpdateStatusAsync(claimedJobId, leaseToken ?? "", "failed", dlError);
                     return false;
                 }
 
@@ -107,7 +113,7 @@ public class AgentWorker
                 {
                     string dlFailMsg = $"Failed to download document from storage: HTTP {dlResponse.StatusCode}";
                     Console.WriteLine($"[ERROR] {dlFailMsg}");
-                    await UpdateStatusAsync(jobId, leaseToken ?? "", "failed", dlFailMsg);
+                    await UpdateStatusAsync(claimedJobId, leaseToken ?? "", "failed", dlFailMsg);
                     return false;
                 }
 
@@ -146,49 +152,43 @@ public class AgentWorker
                 // Dry-run mode must NEVER report a print job as 'completed' on the server.
                 if (_config.DryRun)
                 {
-                    string dryRunMessage = $"[DRY RUN] Verified job {jobId} ({filename}, {fileBytes.Length} bytes). Settings: Copies={settings.Copies}, Orientation={settings.Orientation}, Range={settings.PageRangeType}. Spool submission skipped.";
+                    string dryRunMessage = $"[DRY RUN] Verified job {claimedJobId} ({filename}, {fileBytes.Length} bytes). Settings: Copies={settings.Copies}, Orientation={settings.Orientation}, Range={settings.PageRangeType}. Spool submission skipped.";
                     Console.WriteLine(dryRunMessage);
-                    // Leave job as claimed or report failed with dry-run notice so physical printer is never assumed complete
-                    await UpdateStatusAsync(jobId, leaseToken ?? "", "failed", "Dry-run verification completed (physical printing intentionally skipped).");
+                    await UpdateStatusAsync(claimedJobId, leaseToken ?? "", "failed", "Dry-run verification completed (physical printing intentionally skipped).");
                     return true;
                 }
 
-                // CRITICAL PRINT ARCHITECTURE CHECK:
-                // RAW spooling requires pre-rendered printer-ready PDL (Page Description Language) streams
-                // such as PCL, PostScript, or Windows EMF. Sending raw PDF, Word, Excel, or image files
-                // directly to a GDI/RAW queue on an HP LaserJet M1136 will output raw ASCII garbage or error out.
+                // CRITICAL HARDWARE & SPOOLER SAFETY CHECK:
+                // Blind RAW spooling of unrendered documents (PDF, Word, Excel, PowerPoint, Images,
+                // and ordinary unformatted plain text) directly to the HP LaserJet M1136 printer queue
+                // produces paper jams, garbage raw text, or driver crashes.
                 //
-                // In this MVP foundation:
-                // - Only raw PCL or text formatted through driver can be sent directly to spooler.
-                // - Non-text binary documents (PDF, Office, Images) must be rendered via a dedicated rendering engine
-                //   (e.g., PDFium/Ghostscript/LibreOffice or GDI PrintDocument) into PCL6/raster before live physical spooling.
-                // - If live physical printing is attempted without an active document rendering engine,
-                //   the job is rejected safely rather than wasting paper with garbage text.
+                // RAW spooling is STRICTLY blocked unless the payload is pre-rendered PCL/PostScript
+                // or running in mock-printer mode for unit tests.
+                bool isPreRenderedPcl = format == "pcl" || format == "prn";
 
-                bool isRawPrinterReady = format == "txt" || format == "pcl" || format == "raw";
-
-                if (!isRawPrinterReady && !_config.MockPrinter)
+                if (!isPreRenderedPcl && !_config.MockPrinter)
                 {
-                    string renderLimitationNotice = $"FORMAT_NOT_RENDERED: Format '{format}' requires a configured rasterizer/engine (e.g. PDFium/Ghostscript/LibreOffice) to produce PCL for the HP LaserJet M1136. Raw bytes cannot be safely spooled to physical printer.";
+                    string renderLimitationNotice = $"FORMAT_NOT_RENDERED: Format '{format}' requires a configured rasterizer/engine (e.g. PDFium/Ghostscript/GDI PrintDocument) to produce PCL for the HP LaserJet M1136. Raw bytes cannot be safely spooled to physical printer.";
                     Console.WriteLine($"[RENDER_CHECK] {renderLimitationNotice}");
-                    await UpdateStatusAsync(jobId, leaseToken ?? "", "failed", renderLimitationNotice);
+                    await UpdateStatusAsync(claimedJobId, leaseToken ?? "", "failed", renderLimitationNotice);
                     return false;
                 }
 
                 byte[] spoolPayload = await File.ReadAllBytesAsync(safeTargetFile);
 
                 // Submit to Spooler
-                var spoolRes = _spooler.SubmitSpoolJob(targetPrinter, $"PrintBridge_{jobId}_{filename}", spoolPayload, settings);
+                var spoolRes = _spooler.SubmitSpoolJob(targetPrinter, $"PrintBridge_{claimedJobId}_{filename}", spoolPayload, settings);
 
                 if (spoolRes.Success)
                 {
                     Console.WriteLine($"Spooler acceptance confirmed: {spoolRes.Message}");
-                    await UpdateStatusAsync(jobId, leaseToken ?? "", "completed", spoolRes.Message ?? "Job spooled to printer.");
+                    await UpdateStatusAsync(claimedJobId, leaseToken ?? "", "completed", spoolRes.Message ?? "Job spooled to printer.");
                 }
                 else
                 {
                     Console.WriteLine($"Spooler rejection: {spoolRes.Message}");
-                    await UpdateStatusAsync(jobId, leaseToken ?? "", "failed", spoolRes.Message ?? "Spooler rejected job.");
+                    await UpdateStatusAsync(claimedJobId, leaseToken ?? "", "failed", spoolRes.Message ?? "Spooler rejected job.");
                 }
 
                 return spoolRes.Success;
@@ -203,9 +203,9 @@ public class AgentWorker
         catch (Exception ex)
         {
             Console.WriteLine($"Error processing job: {ex.Message}");
-            if (job != null && leaseToken != null)
+            if (!string.IsNullOrEmpty(claimedJobId) && !string.IsNullOrEmpty(leaseToken))
             {
-                await UpdateStatusAsync(job.Id, leaseToken, "failed", ex.Message);
+                await UpdateStatusAsync(claimedJobId, leaseToken, "failed", ex.Message);
             }
             return false;
         }
